@@ -7,6 +7,7 @@ import MethamphetamineCore
 final class AppController: NSObject, ObservableObject {
   private static let legacyMigrationVersion = 2
   private static let legacyMigrationVersionKey = "legacyHookMigrationVersion"
+  private static let backendRenewInterval: TimeInterval = 30
   static let lowBatterySleepThresholdPercent = 10.0
 
   @Published private(set) var isProtectionEnabled: Bool
@@ -16,20 +17,23 @@ final class AppController: NSObject, ObservableObject {
   @Published private var protectionError: String?
   @Published private var setupError: String?
   @Published private var configurationError: String?
+  @Published private var activityWarning: String?
 
   var detectedAgents: [DetectedCodingAgent] = [] {
     didSet { evaluateProtection() }
   }
 
-  private let detector: CodingAgentSystemScanner
   private let defaults: UserDefaults
   private let protectionStore: AgentProtectionStore
   private let legacyIntegrations: LegacyIntegrationMigrator
   private let backend: SleepProtectionBackend
   private let batteryStatusProvider: BatteryStatusProviding
+  private let codexActivityProvider: CodexActivityProviding
+  private let protectionGraceSeconds: TimeInterval
+  private var codexActivitySnapshot: CodexActivitySnapshot
   private var policy: SleepPolicyMachine
   private var timer: Timer?
-  private var lastScanAt = Date.distantPast
+  private var lastBackendRenewAt = Date.distantPast
   private var started = false
   private var recoveryPending = false
 
@@ -47,16 +51,19 @@ final class AppController: NSObject, ObservableObject {
         closedLid: PMSetPowerProtectBackend()
       ),
       batteryStatusProvider: IOKitBatteryStatusProvider(),
+      codexActivityProvider: CodexSessionActivityMonitor(),
       startsAutomatically: startsAutomatically
     )
   }
 
   init(
     defaults: UserDefaults,
-    detector: CodingAgentSystemScanner,
+    detector _: CodingAgentSystemScanner,
     legacyIntegrations: LegacyIntegrationMigrator,
     backend: SleepProtectionBackend,
     batteryStatusProvider: BatteryStatusProviding = IOKitBatteryStatusProvider(),
+    codexActivityProvider: CodexActivityProviding = CodexSessionActivityMonitor(),
+    protectionGraceSeconds: TimeInterval = 3,
     startsAutomatically: Bool
   ) {
     let protectionStore = AgentProtectionStore(defaults: defaults)
@@ -78,18 +85,20 @@ final class AppController: NSObject, ObservableObject {
       protectionStore.save(isProtectionEnabled)
     }
 
-    self.detector = detector
     self.defaults = defaults
     self.protectionStore = protectionStore
     self.legacyIntegrations = legacyIntegrations
     self.backend = backend
     self.batteryStatusProvider = batteryStatusProvider
+    self.codexActivityProvider = codexActivityProvider
+    self.protectionGraceSeconds = protectionGraceSeconds
+    codexActivitySnapshot = codexActivityProvider.snapshot
     self.isProtectionEnabled = isProtectionEnabled
     self.isLowBatterySleepEnabled = isLowBatterySleepEnabled
     policy = SleepPolicyMachine(
       config: SleepPolicyConfig(
         autoMode: true,
-        graceSeconds: 0
+        graceSeconds: protectionGraceSeconds
       )
     )
 
@@ -103,7 +112,7 @@ final class AppController: NSObject, ObservableObject {
   }
 
   var visibleError: String? {
-    protectionError ?? setupError ?? configurationError
+    protectionError ?? setupError ?? configurationError ?? activityWarning
   }
 
   var statusTitle: String {
@@ -111,6 +120,11 @@ final class AppController: NSObject, ObservableObject {
     if isPreparingProtection { return "Настройка защиты" }
     if setupError != nil { return "Не удалось настроить защиту" }
     if configurationError != nil { return "Не удалось обновить старую версию" }
+    if activityWarning != nil {
+      return codexActivitySnapshot.effectiveActiveCount > 0 && backend.isHeld
+        ? "Codex защищён в резервном режиме"
+        : "Не удалось определить активность Codex"
+    }
     if !isProtectionEnabled { return "Защита от сна выключена" }
 
     switch phase {
@@ -139,26 +153,6 @@ final class AppController: NSObject, ObservableObject {
       object: nil
     )
 
-    let workspaceNotifications = NSWorkspace.shared.notificationCenter
-    workspaceNotifications.addObserver(
-      self,
-      selector: #selector(systemInventoryDidChange),
-      name: NSWorkspace.didLaunchApplicationNotification,
-      object: nil
-    )
-    workspaceNotifications.addObserver(
-      self,
-      selector: #selector(systemInventoryDidChange),
-      name: NSWorkspace.didTerminateApplicationNotification,
-      object: nil
-    )
-    workspaceNotifications.addObserver(
-      self,
-      selector: #selector(systemInventoryDidChange),
-      name: NSWorkspace.didWakeNotification,
-      object: nil
-    )
-
     do {
       try backend.recover()
       recoveryPending = false
@@ -169,9 +163,11 @@ final class AppController: NSObject, ObservableObject {
     }
 
     migrateLegacyIntegrations()
-    refreshAgents(refreshInstallations: true)
+    if isProtectionEnabled {
+      refreshCodexActivity()
+    }
 
-    timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+    timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
       Task { @MainActor in
         self?.tick()
       }
@@ -179,24 +175,35 @@ final class AppController: NSObject, ObservableObject {
   }
 
   func menuDidOpen() {
-    if started {
-      refreshAgents(refreshInstallations: true)
-    } else {
+    if started, isProtectionEnabled {
+      refreshCodexActivity()
+    } else if !started {
       start()
     }
   }
 
-  private func tick() {
-    if Date.now.timeIntervalSince(lastScanAt) >= 2 {
-      refreshAgents()
-    } else {
-      evaluateProtection()
+  func tick() {
+    guard isProtectionEnabled else {
+      if backend.isHeld || recoveryPending {
+        evaluateProtection()
+      }
+      return
     }
+    refreshCodexActivity()
   }
 
-  private func refreshAgents(refreshInstallations: Bool = false) {
-    detectedAgents = detector.detectAgents(refreshInstallations: refreshInstallations)
-    lastScanAt = .now
+  func refreshCodexActivity() {
+    codexActivitySnapshot = codexActivityProvider.refresh()
+    updateActivityWarning()
+    evaluateProtection()
+  }
+
+  private func updateActivityWarning() {
+    guard isProtectionEnabled, codexActivitySnapshot.usesFallback else {
+      activityWarning = nil
+      return
+    }
+    activityWarning = "Не удалось точно определить задачу Codex."
   }
 
   func setProtectionEnabled(_ isEnabled: Bool) {
@@ -252,15 +259,22 @@ final class AppController: NSObject, ObservableObject {
     isProtectionEnabled = isEnabled
     protectionStore.save(isEnabled)
     if clearSetupError { setupError = nil }
+    updateActivityWarning()
 
     if isEnabled {
-      evaluateProtection()
+      refreshCodexActivity()
     } else {
+      codexActivityProvider.reset()
+      codexActivitySnapshot = .idle
       policy = SleepPolicyMachine(
-        config: SleepPolicyConfig(autoMode: true, graceSeconds: 0)
+        config: SleepPolicyConfig(
+          autoMode: true,
+          graceSeconds: protectionGraceSeconds
+        )
       )
       do {
         try backend.release()
+        lastBackendRenewAt = .distantPast
         protectionError = nil
       } catch {
         protectionError = error.localizedDescription
@@ -287,25 +301,48 @@ final class AppController: NSObject, ObservableObject {
       && (batteryStatusProvider.currentStatus()?.isBelow(
         Self.lowBatterySleepThresholdPercent
       ) ?? false)
-    let activeCount =
-      isProtectionEnabled && !shouldAllowSleepForLowBattery
-      ? detectedAgents.count(where: \.isRunning)
-      : 0
+    if !isProtectionEnabled || shouldAllowSleepForLowBattery {
+      policy = SleepPolicyMachine(
+        config: SleepPolicyConfig(
+          autoMode: true,
+          graceSeconds: protectionGraceSeconds
+        )
+      )
+      if backend.isHeld {
+        do {
+          try backend.release()
+          lastBackendRenewAt = .distantPast
+          protectionError = nil
+        } catch {
+          protectionError = error.localizedDescription
+        }
+      }
+      phase = .idle
+      return
+    }
+
+    let activeCount = codexActivitySnapshot.effectiveActiveCount
     let wasHeld = backend.isHeld
+    let now = Date.now
     phase = policy.evaluate(activeCount: activeCount)
 
     if policy.shouldProtect {
       do {
         if wasHeld {
-          try backend.renew()
+          if now.timeIntervalSince(lastBackendRenewAt) >= Self.backendRenewInterval {
+            try backend.renew()
+            lastBackendRenewAt = now
+          }
         } else {
           try backend.acquire()
+          lastBackendRenewAt = now
         }
         protectionError = nil
       } catch {
         let activationError = error
         do {
           try backend.release()
+          lastBackendRenewAt = .distantPast
           protectionError = activationError.localizedDescription
         } catch {
           protectionError = error.localizedDescription
@@ -315,6 +352,7 @@ final class AppController: NSObject, ObservableObject {
       if wasHeld {
         do {
           try backend.release()
+          lastBackendRenewAt = .distantPast
           protectionError = nil
         } catch {
           protectionError = error.localizedDescription
@@ -351,11 +389,6 @@ final class AppController: NSObject, ObservableObject {
   }
 
   @objc
-  private func systemInventoryDidChange() {
-    refreshAgents(refreshInstallations: true)
-  }
-
-  @objc
   private func applicationWillTerminate() {
     shutdown()
   }
@@ -371,6 +404,5 @@ final class AppController: NSObject, ObservableObject {
       NSLog("Methamphetamine failed to restore sleep: %@", error.localizedDescription)
     }
     NotificationCenter.default.removeObserver(self)
-    NSWorkspace.shared.notificationCenter.removeObserver(self)
   }
 }

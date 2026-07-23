@@ -13,7 +13,7 @@ struct MenuContentView: View {
       ) {
         VStack(alignment: .leading, spacing: 2) {
           Text("Не спать")
-          Text("Пока работают агенты")
+          Text("Пока Codex выполняет задачу")
             .font(.caption)
             .foregroundStyle(.secondary)
         }
@@ -21,7 +21,7 @@ struct MenuContentView: View {
       }
       .toggleStyle(.switch)
       .disabled(controller.isPreparingProtection)
-      .accessibilityHint("Учитываются все поддерживаемые агенты")
+      .accessibilityHint("Защита включается только на время активной задачи Codex")
 
       Toggle(
         isOn: Binding(

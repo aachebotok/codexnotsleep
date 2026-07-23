@@ -8,7 +8,7 @@ import Testing
 @MainActor
 struct AppControllerProtectionTests {
   @Test
-  func globalTogglePersistsAndControlsRunningAgents() throws {
+  func globalTogglePersistsAndControlsActiveCodexTask() throws {
     let suiteName = "Methamphetamine.AppControllerProtectionTests.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -17,11 +17,14 @@ struct AppControllerProtectionTests {
     let fixtureHome = FileManager.default.temporaryDirectory
       .appending(path: "Methamphetamine.AppControllerProtectionTests.\(UUID().uuidString)")
     let backend = FakeSleepProtectionBackend()
+    let activity = FakeCodexActivityProvider(snapshot: .active(turnCount: 1))
     let controller = AppController(
       defaults: defaults,
       detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
       legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
       backend: backend,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
       startsAutomatically: false
     )
     let definition = CodingAgentDefinition(
@@ -175,11 +178,14 @@ struct AppControllerProtectionTests {
     let fixtureHome = FileManager.default.temporaryDirectory
       .appending(path: "Methamphetamine.RecoveryBlockingTests.\(UUID().uuidString)")
     let backend = RecoveryBlockingSleepProtectionBackend()
+    let activity = FakeCodexActivityProvider(snapshot: .active(turnCount: 1))
     let controller = AppController(
       defaults: defaults,
       detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
       legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
       backend: backend,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
       startsAutomatically: false
     )
     controller.start()
@@ -206,7 +212,7 @@ struct AppControllerProtectionTests {
   }
 
   @Test
-  func allRunningAgentsParticipateAndLastAgentReleasesImmediately() throws {
+  func onlyActiveCodexTasksControlProtection() throws {
     let suiteName = "Methamphetamine.AllAgentsProtectionTests.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -215,11 +221,14 @@ struct AppControllerProtectionTests {
     let fixtureHome = FileManager.default.temporaryDirectory
       .appending(path: "Methamphetamine.AllAgentsProtectionTests.\(UUID().uuidString)")
     let backend = FakeSleepProtectionBackend()
+    let activity = FakeCodexActivityProvider(snapshot: .idle)
     let controller = AppController(
       defaults: defaults,
       detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
       legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
       backend: backend,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
       startsAutomatically: false
     )
     let codex = CodingAgentDefinition(
@@ -239,32 +248,171 @@ struct AppControllerProtectionTests {
       DetectedCodingAgent(definition: codex, isInstalled: true, isRunning: true),
       DetectedCodingAgent(definition: claude, isInstalled: true, isRunning: true),
     ]
-    #expect(backend.acquireCount == 1)
+    #expect(backend.acquireCount == 0)
+    #expect(controller.phase == .idle)
 
-    controller.detectedAgents = [
-      DetectedCodingAgent(definition: codex, isInstalled: true, isRunning: false),
-      DetectedCodingAgent(definition: claude, isInstalled: true, isRunning: true),
-    ]
+    activity.snapshot = .active(turnCount: 1)
+    controller.refreshCodexActivity()
     #expect(controller.phase == .protected(reason: "running_agent"))
     #expect(backend.acquireCount == 1)
 
-    controller.detectedAgents = [
-      DetectedCodingAgent(definition: codex, isInstalled: true, isRunning: false),
-      DetectedCodingAgent(definition: claude, isInstalled: true, isRunning: false),
-    ]
+    activity.snapshot = .idle
+    controller.refreshCodexActivity()
     #expect(controller.phase == .idle)
     #expect(!backend.isHeld)
 
-    controller.detectedAgents = [
-      DetectedCodingAgent(definition: codex, isInstalled: true, isRunning: true),
-      DetectedCodingAgent(definition: claude, isInstalled: true, isRunning: false),
-    ]
+    activity.snapshot = .active(turnCount: 2)
+    controller.refreshCodexActivity()
     #expect(controller.phase == .protected(reason: "running_agent"))
     #expect(backend.acquireCount == 2)
 
     controller.setProtectionEnabled(false)
     #expect(controller.phase == .idle)
     #expect(!backend.isHeld)
+  }
+
+  @Test
+  func replacementTaskDoesNotPulseProtectionOffDuringGrace() throws {
+    let suiteName = "Methamphetamine.ReplacementGraceTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    defaults.set(true, forKey: "agentSleepProtectionEnabled")
+
+    let fixtureHome = FileManager.default.temporaryDirectory
+      .appending(path: "Methamphetamine.ReplacementGraceTests.\(UUID().uuidString)")
+    let backend = FakeSleepProtectionBackend()
+    let activity = FakeCodexActivityProvider(snapshot: .active(turnCount: 1))
+    let controller = AppController(
+      defaults: defaults,
+      detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
+      legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
+      backend: backend,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 3,
+      startsAutomatically: false
+    )
+
+    controller.refreshCodexActivity()
+    #expect(backend.acquireCount == 1)
+
+    activity.snapshot = .idle
+    controller.refreshCodexActivity()
+    if case .grace = controller.phase {
+      #expect(backend.isHeld)
+    } else {
+      Issue.record("После завершения должна начаться защитная пауза")
+    }
+
+    activity.snapshot = .active(turnCount: 1)
+    controller.refreshCodexActivity()
+    #expect(controller.phase == .protected(reason: "running_agent"))
+    #expect(backend.acquireCount == 1)
+    #expect(backend.releaseCount == 0)
+    #expect(backend.renewCount == 0)
+  }
+
+  @Test
+  func unavailableCodexStreamUsesFailSafeOnlyWhileToggleIsOn() throws {
+    let suiteName = "Methamphetamine.ActivityFallbackTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    defaults.set(true, forKey: "agentSleepProtectionEnabled")
+
+    let fixtureHome = FileManager.default.temporaryDirectory
+      .appending(path: "Methamphetamine.ActivityFallbackTests.\(UUID().uuidString)")
+    let backend = FakeSleepProtectionBackend()
+    let activity = FakeCodexActivityProvider(
+      snapshot: .unavailable(protectConservatively: true)
+    )
+    let controller = AppController(
+      defaults: defaults,
+      detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
+      legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
+      backend: backend,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
+      startsAutomatically: false
+    )
+
+    controller.refreshCodexActivity()
+    #expect(backend.isHeld)
+    #expect(controller.visibleError == "Не удалось точно определить задачу Codex.")
+
+    controller.setProtectionEnabled(false)
+    #expect(!backend.isHeld)
+    #expect(controller.visibleError == nil)
+  }
+
+  @Test
+  func disabledToggleDoesNotPollCodexSessions() throws {
+    let suiteName = "Methamphetamine.DisabledActivityPollingTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    defaults.set(false, forKey: "agentSleepProtectionEnabled")
+
+    let fixtureHome = FileManager.default.temporaryDirectory
+      .appending(path: "Methamphetamine.DisabledActivityPollingTests.\(UUID().uuidString)")
+    let activity = FakeCodexActivityProvider(snapshot: .active(turnCount: 1))
+    let controller = AppController(
+      defaults: defaults,
+      detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
+      legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
+      backend: FakeSleepProtectionBackend(),
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
+      startsAutomatically: false
+    )
+
+    controller.start()
+    #expect(activity.refreshCount == 0)
+
+    controller.setProtectionEnabled(true)
+    #expect(activity.refreshCount == 1)
+    controller.refreshCodexActivity()
+    #expect(activity.refreshCount == 2)
+
+    controller.setProtectionEnabled(false)
+    #expect(activity.resetCount == 1)
+  }
+
+  @Test
+  func failedReleaseRetriesWhileProtectionIsOffWithoutPollingCodex() throws {
+    let suiteName = "Methamphetamine.ReleaseRetryTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    defaults.set(true, forKey: "agentSleepProtectionEnabled")
+
+    let fixtureHome = FileManager.default.temporaryDirectory
+      .appending(path: "Methamphetamine.ReleaseRetryTests.\(UUID().uuidString)")
+    let backend = TransientReleaseFailureBackend()
+    let activity = FakeCodexActivityProvider(snapshot: .active(turnCount: 1))
+    let controller = AppController(
+      defaults: defaults,
+      detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
+      legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
+      backend: backend,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
+      startsAutomatically: false
+    )
+
+    controller.refreshCodexActivity()
+    #expect(backend.isHeld)
+
+    backend.failNextRelease = true
+    controller.setProtectionEnabled(false)
+    #expect(backend.isHeld)
+    #expect(backend.releaseAttempts == 1)
+    #expect(controller.visibleError != nil)
+    #expect(activity.resetCount == 1)
+
+    let refreshCount = activity.refreshCount
+    controller.tick()
+
+    #expect(!backend.isHeld)
+    #expect(backend.releaseAttempts == 2)
+    #expect(controller.visibleError == nil)
+    #expect(activity.refreshCount == refreshCount)
   }
 
   @Test
@@ -281,12 +429,15 @@ struct AppControllerProtectionTests {
     let battery = FakeBatteryStatusProvider(
       status: BatteryStatus(chargePercent: 50, isRunningOnBattery: true)
     )
+    let activity = FakeCodexActivityProvider(snapshot: .active(turnCount: 1))
     let controller = AppController(
       defaults: defaults,
       detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
       legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
       backend: backend,
       batteryStatusProvider: battery,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
       startsAutomatically: false
     )
     let runningAgent = DetectedCodingAgent(
@@ -329,12 +480,15 @@ struct AppControllerProtectionTests {
     let battery = FakeBatteryStatusProvider(
       status: BatteryStatus(chargePercent: 9, isRunningOnBattery: false)
     )
+    let activity = FakeCodexActivityProvider(snapshot: .active(turnCount: 1))
     let controller = AppController(
       defaults: defaults,
       detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
       legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
       backend: backend,
       batteryStatusProvider: battery,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
       startsAutomatically: false
     )
     let runningAgent = DetectedCodingAgent(
@@ -371,12 +525,15 @@ struct AppControllerProtectionTests {
     let battery = FakeBatteryStatusProvider(
       status: BatteryStatus(chargePercent: 9, isRunningOnBattery: true)
     )
+    let activity = FakeCodexActivityProvider(snapshot: .active(turnCount: 1))
     let controller = AppController(
       defaults: defaults,
       detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
       legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
       backend: backend,
       batteryStatusProvider: battery,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
       startsAutomatically: false
     )
     controller.detectedAgents = [
@@ -409,13 +566,16 @@ private final class FakeSleepProtectionBackend: SleepProtectionBackend {
   private(set) var isHeld = false
   private(set) var acquireCount = 0
   private(set) var releaseCount = 0
+  private(set) var renewCount = 0
 
   func acquire() throws {
     acquireCount += 1
     isHeld = true
   }
 
-  func renew() throws {}
+  func renew() throws {
+    renewCount += 1
+  }
 
   func release() {
     releaseCount += 1
@@ -433,6 +593,52 @@ private final class FakeBatteryStatusProvider: BatteryStatusProviding {
   func currentStatus() -> BatteryStatus? {
     status
   }
+}
+
+private final class FakeCodexActivityProvider: CodexActivityProviding {
+  var snapshot: CodexActivitySnapshot
+  private(set) var refreshCount = 0
+  private(set) var resetCount = 0
+
+  init(snapshot: CodexActivitySnapshot) {
+    self.snapshot = snapshot
+  }
+
+  func refresh() -> CodexActivitySnapshot {
+    refreshCount += 1
+    return snapshot
+  }
+
+  func reset() {
+    resetCount += 1
+  }
+}
+
+@MainActor
+private final class TransientReleaseFailureBackend: SleepProtectionBackend {
+  let identifier = "release-retry-fake"
+  private(set) var isHeld = false
+  private(set) var releaseAttempts = 0
+  var failNextRelease = false
+
+  func acquire() throws {
+    isHeld = true
+  }
+
+  func renew() throws {}
+
+  func release() throws {
+    releaseAttempts += 1
+    if failNextRelease {
+      failNextRelease = false
+      throw TestReleaseError.transientFailure
+    }
+    isHeld = false
+  }
+}
+
+private enum TestReleaseError: Error {
+  case transientFailure
 }
 
 @MainActor
