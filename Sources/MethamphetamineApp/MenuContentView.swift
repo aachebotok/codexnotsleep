@@ -5,39 +5,32 @@ struct MenuContentView: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
-      Toggle(
-        isOn: Binding(
-          get: { controller.isProtectionEnabled },
-          set: { controller.setProtectionEnabled($0) }
-        )
-      ) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("Не спать")
-          Text("Пока Codex выполняет задачу")
-            .font(.caption)
-            .foregroundStyle(.secondary)
+      VStack(alignment: .leading, spacing: 6) {
+        Toggle(
+          isOn: Binding(
+            get: { controller.isProtectionEnabled },
+            set: { controller.setProtectionEnabled($0) }
+          )
+        ) {
+          VStack(alignment: .leading, spacing: 2) {
+            Text("Не засыпать")
+            Text("Пока работает Codex")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-      }
-      .toggleStyle(.switch)
-      .disabled(controller.isPreparingProtection)
-      .accessibilityHint("Защита включается только на время активной задачи Codex")
+        .toggleStyle(.switch)
+        .disabled(controller.isPreparingProtection)
+        .accessibilityHint("Mac не засыпает во время активной задачи Codex")
 
-      Toggle(
-        isOn: Binding(
-          get: { controller.isLowBatterySleepEnabled },
-          set: { controller.setLowBatterySleepEnabled($0) }
-        )
-      ) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("Экономить заряд")
-          Text("Разрешать сон при заряде ниже 10%")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        Divider()
+          .padding(.top, 8)
+
+        Text("Mac сможет уснуть при заряде 10% и ниже")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
-      .toggleStyle(.switch)
 
       if let error = controller.visibleError {
         Divider()

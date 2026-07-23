@@ -7,16 +7,17 @@ import MethamphetamineCore
 final class AppController: NSObject, ObservableObject {
   private static let legacyMigrationVersion = 2
   private static let legacyMigrationVersionKey = "legacyHookMigrationVersion"
+  private static let activityRefreshInterval: TimeInterval = 1
   private static let backendRenewInterval: TimeInterval = 30
   static let lowBatterySleepThresholdPercent = 10.0
 
   @Published private(set) var isProtectionEnabled: Bool
-  @Published private(set) var isLowBatterySleepEnabled: Bool
   @Published private(set) var isPreparingProtection = false
   @Published private(set) var phase: ProtectionPhase = .idle
   @Published private var protectionError: String?
   @Published private var setupError: String?
   @Published private var configurationError: String?
+  @Published private var launchAtLoginError: String?
   @Published private var activityWarning: String?
 
   var detectedAgents: [DetectedCodingAgent] = [] {
@@ -29,6 +30,7 @@ final class AppController: NSObject, ObservableObject {
   private let backend: SleepProtectionBackend
   private let batteryStatusProvider: BatteryStatusProviding
   private let codexActivityProvider: CodexActivityProviding
+  private let launchAtLoginController: any LaunchAtLoginControlling
   private let protectionGraceSeconds: TimeInterval
   private var codexActivitySnapshot: CodexActivitySnapshot
   private var policy: SleepPolicyMachine
@@ -52,6 +54,7 @@ final class AppController: NSObject, ObservableObject {
       ),
       batteryStatusProvider: IOKitBatteryStatusProvider(),
       codexActivityProvider: CodexSessionActivityMonitor(),
+      launchAtLoginController: LaunchAtLoginController(),
       startsAutomatically: startsAutomatically
     )
   }
@@ -63,13 +66,12 @@ final class AppController: NSObject, ObservableObject {
     backend: SleepProtectionBackend,
     batteryStatusProvider: BatteryStatusProviding = IOKitBatteryStatusProvider(),
     codexActivityProvider: CodexActivityProviding = CodexSessionActivityMonitor(),
+    launchAtLoginController: any LaunchAtLoginControlling = NoOpLaunchAtLoginController(),
     protectionGraceSeconds: TimeInterval = 3,
     startsAutomatically: Bool
   ) {
     let protectionStore = AgentProtectionStore(defaults: defaults)
     let storedPreference = protectionStore.load()
-    let isLowBatterySleepEnabled = protectionStore.loadLowBatterySleep()
-    protectionStore.saveLowBatterySleep(isLowBatterySleepEnabled)
     let pendingSetup = protectionStore.isPowerProtectSetupPending
     let isProtectionEnabled: Bool
     if backend.requiresSetup && (storedPreference || pendingSetup) {
@@ -91,10 +93,10 @@ final class AppController: NSObject, ObservableObject {
     self.backend = backend
     self.batteryStatusProvider = batteryStatusProvider
     self.codexActivityProvider = codexActivityProvider
+    self.launchAtLoginController = launchAtLoginController
     self.protectionGraceSeconds = protectionGraceSeconds
     codexActivitySnapshot = codexActivityProvider.snapshot
     self.isProtectionEnabled = isProtectionEnabled
-    self.isLowBatterySleepEnabled = isLowBatterySleepEnabled
     policy = SleepPolicyMachine(
       config: SleepPolicyConfig(
         autoMode: true,
@@ -112,7 +114,7 @@ final class AppController: NSObject, ObservableObject {
   }
 
   var visibleError: String? {
-    protectionError ?? setupError ?? configurationError ?? activityWarning
+    protectionError ?? setupError ?? configurationError ?? launchAtLoginError ?? activityWarning
   }
 
   var statusTitle: String {
@@ -120,6 +122,7 @@ final class AppController: NSObject, ObservableObject {
     if isPreparingProtection { return "Настройка защиты" }
     if setupError != nil { return "Не удалось настроить защиту" }
     if configurationError != nil { return "Не удалось обновить старую версию" }
+    if launchAtLoginError != nil { return "Не удалось включить автозапуск" }
     if activityWarning != nil {
       return codexActivitySnapshot.effectiveActiveCount > 0 && backend.isHeld
         ? "Codex защищён в резервном режиме"
@@ -163,11 +166,15 @@ final class AppController: NSObject, ObservableObject {
     }
 
     migrateLegacyIntegrations()
+    launchAtLoginError = launchAtLoginController.enableByDefault()
     if isProtectionEnabled {
       refreshCodexActivity()
     }
 
-    timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+    timer = Timer.scheduledTimer(
+      withTimeInterval: Self.activityRefreshInterval,
+      repeats: true
+    ) { [weak self] _ in
       Task { @MainActor in
         self?.tick()
       }
@@ -246,12 +253,6 @@ final class AppController: NSObject, ObservableObject {
     }
   }
 
-  func setLowBatterySleepEnabled(_ isEnabled: Bool) {
-    isLowBatterySleepEnabled = isEnabled
-    protectionStore.saveLowBatterySleep(isEnabled)
-    evaluateProtection()
-  }
-
   private func applyProtectionPreference(
     _ isEnabled: Bool,
     clearSetupError: Bool = true
@@ -297,10 +298,9 @@ final class AppController: NSObject, ObservableObject {
     }
 
     let shouldAllowSleepForLowBattery =
-      isLowBatterySleepEnabled
-      && (batteryStatusProvider.currentStatus()?.isBelow(
+      batteryStatusProvider.currentStatus()?.isAtOrBelow(
         Self.lowBatterySleepThresholdPercent
-      ) ?? false)
+      ) ?? false
     if !isProtectionEnabled || shouldAllowSleepForLowBattery {
       policy = SleepPolicyMachine(
         config: SleepPolicyConfig(

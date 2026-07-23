@@ -21,16 +21,16 @@ struct BatteryStatusProviderTests {
     )
 
     #expect(status.chargePercent == 9.5)
-    #expect(status.isBelow(10))
+    #expect(status.isAtOrBelow(10))
   }
 
   @Test
-  func exactThresholdAndExternalPowerDoNotCountAsLowBattery() throws {
+  func exactThresholdCountsAsLowBatteryOnlyWhileRunningOnBattery() throws {
     let onBattery = BatteryStatus(chargePercent: 10, isRunningOnBattery: true)
     let onExternalPower = BatteryStatus(chargePercent: 9, isRunningOnBattery: false)
 
-    #expect(!onBattery.isBelow(10))
-    #expect(!onExternalPower.isBelow(10))
+    #expect(onBattery.isAtOrBelow(10))
+    #expect(!onExternalPower.isAtOrBelow(10))
   }
 
   @Test

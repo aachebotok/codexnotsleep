@@ -421,7 +421,6 @@ struct AppControllerProtectionTests {
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
     defaults.set(true, forKey: "agentSleepProtectionEnabled")
-    defaults.set(true, forKey: "lowBatterySleepEnabled")
 
     let fixtureHome = FileManager.default.temporaryDirectory
       .appending(path: "Methamphetamine.LowBatterySleepTests.\(UUID().uuidString)")
@@ -462,6 +461,11 @@ struct AppControllerProtectionTests {
 
     battery.status = BatteryStatus(chargePercent: 10, isRunningOnBattery: true)
     controller.detectedAgents = [runningAgent]
+    #expect(!backend.isHeld)
+    #expect(backend.acquireCount == 1)
+
+    battery.status = BatteryStatus(chargePercent: 11, isRunningOnBattery: true)
+    controller.detectedAgents = [runningAgent]
     #expect(backend.isHeld)
     #expect(backend.acquireCount == 2)
   }
@@ -472,7 +476,6 @@ struct AppControllerProtectionTests {
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
     defaults.set(true, forKey: "agentSleepProtectionEnabled")
-    defaults.set(true, forKey: "lowBatterySleepEnabled")
 
     let fixtureHome = FileManager.default.temporaryDirectory
       .appending(path: "Methamphetamine.LowBatteryExternalPowerTests.\(UUID().uuidString)")
@@ -512,15 +515,15 @@ struct AppControllerProtectionTests {
   }
 
   @Test
-  func lowBatteryToggleImmediatelyReevaluatesAndPersists() throws {
-    let suiteName = "Methamphetamine.LowBatteryToggleTests.\(UUID().uuidString)"
+  func legacyOptOutCannotDisableMandatoryLowBatterySafeguard() throws {
+    let suiteName = "Methamphetamine.LowBatterySafeguardTests.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
     defaults.set(true, forKey: "agentSleepProtectionEnabled")
-    defaults.set(true, forKey: "lowBatterySleepEnabled")
+    defaults.set(false, forKey: "lowBatterySleepEnabled")
 
     let fixtureHome = FileManager.default.temporaryDirectory
-      .appending(path: "Methamphetamine.LowBatteryToggleTests.\(UUID().uuidString)")
+      .appending(path: "Methamphetamine.LowBatterySafeguardTests.\(UUID().uuidString)")
     let backend = FakeSleepProtectionBackend()
     let battery = FakeBatteryStatusProvider(
       status: BatteryStatus(chargePercent: 9, isRunningOnBattery: true)
@@ -550,13 +553,6 @@ struct AppControllerProtectionTests {
     ]
 
     #expect(!backend.isHeld)
-    controller.setLowBatterySleepEnabled(false)
-    #expect(backend.isHeld)
-    #expect(!defaults.bool(forKey: "lowBatterySleepEnabled"))
-
-    controller.setLowBatterySleepEnabled(true)
-    #expect(!backend.isHeld)
-    #expect(defaults.bool(forKey: "lowBatterySleepEnabled"))
   }
 }
 

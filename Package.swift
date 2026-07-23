@@ -17,6 +17,7 @@ let package = Package(
         .linkedFramework("AppKit"),
         .linkedFramework("IOKit"),
         .linkedFramework("Security"),
+        .linkedFramework("ServiceManagement"),
       ]
     ),
     .testTarget(name: "MethamphetamineCoreTests", dependencies: ["MethamphetamineCore"]),

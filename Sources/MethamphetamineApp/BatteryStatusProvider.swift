@@ -5,8 +5,8 @@ struct BatteryStatus: Equatable, Sendable {
   let chargePercent: Double
   let isRunningOnBattery: Bool
 
-  func isBelow(_ thresholdPercent: Double) -> Bool {
-    isRunningOnBattery && chargePercent < thresholdPercent
+  func isAtOrBelow(_ thresholdPercent: Double) -> Bool {
+    isRunningOnBattery && chargePercent <= thresholdPercent
   }
 }
 

@@ -10,6 +10,42 @@ import Testing
 @MainActor
 struct MenuContentViewLayoutTests {
   @Test
+  func menuKeepsOneToggleInEveryProtectionState() throws {
+    let suiteName = "Methamphetamine.MenuLayoutTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let fixtureHome = FileManager.default.temporaryDirectory.appending(
+      path: "Methamphetamine.MenuLayoutTests.\(UUID().uuidString)",
+      directoryHint: .isDirectory
+    )
+    let disabledController = AppController(
+      defaults: defaults,
+      detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
+      legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
+      backend: LayoutTestSleepProtectionBackend(),
+      startsAutomatically: false
+    )
+    let disabledSize = NSHostingView(
+      rootView: MenuContentView(controller: disabledController)
+    ).fittingSize
+
+    defaults.set(true, forKey: "agentSleepProtectionEnabled")
+    let enabledController = AppController(
+      defaults: defaults,
+      detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
+      legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
+      backend: LayoutTestSleepProtectionBackend(),
+      startsAutomatically: false
+    )
+    let enabledSize = NSHostingView(
+      rootView: MenuContentView(controller: enabledController)
+    ).fittingSize
+
+    #expect(enabledSize == disabledSize)
+  }
+
+  @Test
   func detectedAgentsDoNotAddIndividualRows() throws {
     let suiteName = "Methamphetamine.MenuLayoutTests.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))

@@ -49,19 +49,4 @@ struct AgentProtectionStoreTests {
 
     #expect(!store.load())
   }
-
-  @Test
-  func lowBatterySleepDefaultsOnAndPersistsExplicitChoice() throws {
-    let suiteName = "Methamphetamine.AgentProtectionStoreTests.\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suiteName))
-    defer { defaults.removePersistentDomain(forName: suiteName) }
-
-    let store = AgentProtectionStore(defaults: defaults)
-    #expect(store.loadLowBatterySleep())
-
-    store.saveLowBatterySleep(false)
-
-    let restoredStore = AgentProtectionStore(defaults: defaults)
-    #expect(!restoredStore.loadLowBatterySleep())
-  }
 }

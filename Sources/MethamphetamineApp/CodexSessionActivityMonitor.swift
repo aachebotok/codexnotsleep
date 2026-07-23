@@ -1,4 +1,5 @@
 import Darwin
+import CoreServices
 import Foundation
 
 enum CodexActivitySnapshot: Equatable, Sendable {
@@ -72,20 +73,146 @@ enum CodexOpenSessionLocatorError: LocalizedError {
   }
 }
 
-struct LibprocCodexOpenSessionLocator: CodexOpenSessionLocating {
+struct CodexSessionFileChanges {
+  var paths = Set<String>()
+  var requiresFullScan = false
+}
+
+protocol CodexSessionFileChangeObserving: AnyObject {
+  func takeChanges() -> CodexSessionFileChanges
+}
+
+final class FSEventsCodexSessionFileChangeObserver: CodexSessionFileChangeObserving {
+  private let lock = NSLock()
+  private let queue = DispatchQueue(
+    label: "app.methamphetamine.codex-session-events",
+    qos: .utility
+  )
+  private var pendingChanges = CodexSessionFileChanges()
+  private var stream: FSEventStreamRef?
+
+  init(sessionRoot: URL) {
+    var context = FSEventStreamContext(
+      version: 0,
+      info: Unmanaged.passUnretained(self).toOpaque(),
+      retain: nil,
+      release: nil,
+      copyDescription: nil
+    )
+    let flags =
+      FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes)
+      | FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents)
+      | FSEventStreamCreateFlags(kFSEventStreamCreateFlagNoDefer)
+    stream = FSEventStreamCreate(
+      kCFAllocatorDefault,
+      Self.callback,
+      &context,
+      [sessionRoot.path] as CFArray,
+      FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+      0.1,
+      flags
+    )
+    guard let stream else {
+      pendingChanges.requiresFullScan = true
+      return
+    }
+    FSEventStreamSetDispatchQueue(stream, queue)
+    if !FSEventStreamStart(stream) {
+      pendingChanges.requiresFullScan = true
+    }
+  }
+
+  deinit {
+    if let stream {
+      FSEventStreamStop(stream)
+      FSEventStreamInvalidate(stream)
+      FSEventStreamRelease(stream)
+    }
+  }
+
+  func takeChanges() -> CodexSessionFileChanges {
+    lock.withLock {
+      let changes = pendingChanges
+      pendingChanges = CodexSessionFileChanges()
+      return changes
+    }
+  }
+
+  private func receive(
+    paths: [String],
+    flags: UnsafePointer<FSEventStreamEventFlags>,
+    count: Int
+  ) {
+    lock.withLock {
+      for index in 0..<count {
+        let eventFlags = flags[index]
+        if eventFlags
+          & FSEventStreamEventFlags(
+            kFSEventStreamEventFlagMustScanSubDirs
+              | kFSEventStreamEventFlagUserDropped
+              | kFSEventStreamEventFlagKernelDropped
+              | kFSEventStreamEventFlagEventIdsWrapped
+              | kFSEventStreamEventFlagRootChanged
+          ) != 0
+        {
+          pendingChanges.requiresFullScan = true
+        }
+        if index < paths.count {
+          pendingChanges.paths.insert(paths[index])
+        }
+      }
+    }
+  }
+
+  private static let callback: FSEventStreamCallback = {
+    _, callbackInfo, eventCount, eventPaths, eventFlags, _ in
+    guard let callbackInfo else { return }
+    let observer = Unmanaged<FSEventsCodexSessionFileChangeObserver>
+      .fromOpaque(callbackInfo)
+      .takeUnretainedValue()
+    let pathArray = unsafeBitCast(eventPaths, to: NSArray.self)
+    observer.receive(
+      paths: pathArray as? [String] ?? [],
+      flags: eventFlags,
+      count: eventCount
+    )
+  }
+}
+
+final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating {
+  private static let discoveryInterval: TimeInterval = 30
+  private static let processStartTolerance: TimeInterval = 5
+
   private let sessionRoot: URL
   private let userID: uid_t
   private let processInspector: any CodexProcessInspecting
+  private let fileManager: FileManager
+  private let minimumDiscoveryInterval: TimeInterval
+  private let now: () -> Date
+  private let changeObserver: any CodexSessionFileChangeObserving
+  private var discoveredPaths = Set<String>()
+  private var discoveryWasReliable = true
+  private var discoveredForRuntimeStartedAt: Date?
+  private var lastDiscoveryAt = Date.distantPast
 
   init(
     sessionRoot: URL = FileManager.default.homeDirectoryForCurrentUser
       .appending(path: ".codex/sessions"),
     userID: uid_t = getuid(),
-    processInspector: any CodexProcessInspecting = LibprocCodexProcessInspector()
+    processInspector: any CodexProcessInspecting = LibprocCodexProcessInspector(),
+    fileManager: FileManager = .default,
+    minimumDiscoveryInterval: TimeInterval = LibprocCodexOpenSessionLocator.discoveryInterval,
+    now: @escaping () -> Date = Date.init,
+    changeObserver: (any CodexSessionFileChangeObserving)? = nil
   ) {
     self.sessionRoot = sessionRoot.standardizedFileURL.resolvingSymlinksInPath()
     self.userID = userID
     self.processInspector = processInspector
+    self.fileManager = fileManager
+    self.minimumDiscoveryInterval = minimumDiscoveryInterval
+    self.now = now
+    self.changeObserver =
+      changeObserver ?? FSEventsCodexSessionFileChangeObserver(sessionRoot: self.sessionRoot)
   }
 
   func locateOpenSessions() throws -> CodexOpenSessionInventory {
@@ -93,8 +220,13 @@ struct LibprocCodexOpenSessionLocator: CodexOpenSessionLocating {
       throw CodexOpenSessionLocatorError.processInventoryUnavailable
     }
     guard !codexProcesses.isEmpty else {
+      resetDiscovery()
       return CodexOpenSessionInventory(hasCodexRuntime: false, files: [], isReliable: true)
     }
+
+    let runtimeStartedAt = codexProcesses.map(\.startedAt).min() ?? .distantPast
+    applyFileChanges(runtimeStartedAt: runtimeStartedAt)
+    refreshDiscoveredPathsIfNeeded(runtimeStartedAt: runtimeStartedAt)
 
     var ownersByPath: [String: Date] = [:]
     var readableProcessCount = 0
@@ -107,10 +239,18 @@ struct LibprocCodexOpenSessionLocator: CodexOpenSessionLocating {
 
       for path in paths where isSessionJSONL(path) {
         if let existing = ownersByPath[path] {
-          ownersByPath[path] = max(existing, process.startedAt)
+          ownersByPath[path] = min(existing, process.startedAt)
         } else {
           ownersByPath[path] = process.startedAt
         }
+      }
+    }
+
+    for path in discoveredPaths {
+      if let existing = ownersByPath[path] {
+        ownersByPath[path] = min(existing, runtimeStartedAt)
+      } else {
+        ownersByPath[path] = runtimeStartedAt
       }
     }
 
@@ -125,8 +265,91 @@ struct LibprocCodexOpenSessionLocator: CodexOpenSessionLocating {
     return CodexOpenSessionInventory(
       hasCodexRuntime: true,
       files: files,
-      isReliable: readableProcessCount == codexProcesses.count
+      isReliable: readableProcessCount == codexProcesses.count && discoveryWasReliable
     )
+  }
+
+  private func applyFileChanges(runtimeStartedAt: Date) {
+    let changes = changeObserver.takeChanges()
+    if changes.requiresFullScan {
+      lastDiscoveryAt = .distantPast
+    }
+    let cutoff = runtimeStartedAt.addingTimeInterval(-Self.processStartTolerance)
+    for path in changes.paths where isSessionJSONL(path) {
+      let url = URL(fileURLWithPath: path).standardizedFileURL
+      do {
+        let values = try url.resourceValues(
+          forKeys: [.contentModificationDateKey, .isRegularFileKey]
+        )
+        if values.isRegularFile == true,
+          let modifiedAt = values.contentModificationDate,
+          modifiedAt >= cutoff
+        {
+          discoveredPaths.insert(url.path)
+        } else {
+          discoveredPaths.remove(url.path)
+        }
+      } catch {
+        if !fileManager.fileExists(atPath: url.path) {
+          discoveredPaths.remove(url.path)
+        } else {
+          discoveryWasReliable = false
+        }
+      }
+    }
+  }
+
+  private func refreshDiscoveredPathsIfNeeded(runtimeStartedAt: Date) {
+    let currentTime = now()
+    let runtimeChanged = discoveredForRuntimeStartedAt != runtimeStartedAt
+    guard
+      runtimeChanged
+        || currentTime.timeIntervalSince(lastDiscoveryAt) >= minimumDiscoveryInterval
+    else { return }
+
+    let cutoff = runtimeStartedAt.addingTimeInterval(-Self.processStartTolerance)
+    let resourceKeys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
+    var paths = Set<String>()
+    var wasReliable = true
+    let enumerator = fileManager.enumerator(
+      at: sessionRoot,
+      includingPropertiesForKeys: resourceKeys,
+      options: [.skipsHiddenFiles, .skipsPackageDescendants]
+    ) { _, _ in
+      wasReliable = false
+      return true
+    }
+
+    if let enumerator {
+      for case let url as URL in enumerator {
+        guard isSessionJSONL(url.path) else { continue }
+        do {
+          let values = try url.resourceValues(forKeys: Set(resourceKeys))
+          guard
+            values.isRegularFile == true,
+            let modifiedAt = values.contentModificationDate,
+            modifiedAt >= cutoff
+          else { continue }
+          paths.insert(url.standardizedFileURL.path)
+        } catch {
+          wasReliable = false
+        }
+      }
+    } else if fileManager.fileExists(atPath: sessionRoot.path) {
+      wasReliable = false
+    }
+
+    discoveredPaths = paths
+    discoveryWasReliable = wasReliable
+    discoveredForRuntimeStartedAt = runtimeStartedAt
+    lastDiscoveryAt = currentTime
+  }
+
+  private func resetDiscovery() {
+    discoveredPaths.removeAll()
+    discoveryWasReliable = true
+    discoveredForRuntimeStartedAt = nil
+    lastDiscoveryAt = .distantPast
   }
 
   private func isSessionJSONL(_ path: String) -> Bool {

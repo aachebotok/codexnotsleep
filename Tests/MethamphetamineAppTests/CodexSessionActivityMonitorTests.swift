@@ -342,6 +342,107 @@ struct CodexSessionActivityMonitorTests {
   }
 
   @Test
+  func discoversBackgroundTaskWithoutAnOpenFileDescriptor() throws {
+    let fixture = try SessionFixture()
+    let runtimeStartedAt = Date(timeIntervalSince1970: 3_000)
+    let file = try fixture.makeRootSession(events: [start("background", startedAt: 3_100)])
+    try fixture.setModificationDate(Date(timeIntervalSince1970: 3_100), for: file)
+    let inspector = FakeCodexProcessInspector(
+      processes: [CodexRuntimeProcess(processID: 101, startedAt: runtimeStartedAt)],
+      pathsByProcessID: [101: []],
+      unreadableProcessIDs: []
+    )
+    let locator = LibprocCodexOpenSessionLocator(
+      sessionRoot: fixture.directory,
+      userID: 501,
+      processInspector: inspector,
+      minimumDiscoveryInterval: 0,
+      now: { Date(timeIntervalSince1970: 3_200) }
+    )
+    let monitor = CodexSessionActivityMonitor(locator: locator)
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+  }
+
+  @Test
+  func sessionFromBeforeTheCurrentRuntimeDoesNotCreateStaleActivity() throws {
+    let fixture = try SessionFixture()
+    let file = try fixture.makeRootSession(events: [start("stale", startedAt: 2_000)])
+    try fixture.setModificationDate(Date(timeIntervalSince1970: 2_000), for: file)
+    let inspector = FakeCodexProcessInspector(
+      processes: [
+        CodexRuntimeProcess(
+          processID: 101,
+          startedAt: Date(timeIntervalSince1970: 3_000)
+        )
+      ],
+      pathsByProcessID: [101: []],
+      unreadableProcessIDs: []
+    )
+    let locator = LibprocCodexOpenSessionLocator(
+      sessionRoot: fixture.directory,
+      userID: 501,
+      processInspector: inspector,
+      minimumDiscoveryInterval: 0,
+      now: { Date(timeIntervalSince1970: 3_200) }
+    )
+
+    let inventory = try locator.locateOpenSessions()
+    #expect(inventory.files.isEmpty)
+    #expect(inventory.isReliable)
+  }
+
+  @Test
+  func fileEventAddsAResumedBackgroundSessionWithoutAnotherFullScan() throws {
+    let fixture = try SessionFixture()
+    let runtimeStartedAt = Date(timeIntervalSince1970: 3_000)
+    let file = try fixture.makeRootSession(events: [])
+    try fixture.setModificationDate(Date(timeIntervalSince1970: 2_000), for: file)
+    let observer = FakeCodexSessionFileChangeObserver()
+    let inspector = FakeCodexProcessInspector(
+      processes: [CodexRuntimeProcess(processID: 101, startedAt: runtimeStartedAt)],
+      pathsByProcessID: [101: []],
+      unreadableProcessIDs: []
+    )
+    let locator = LibprocCodexOpenSessionLocator(
+      sessionRoot: fixture.directory,
+      userID: 501,
+      processInspector: inspector,
+      minimumDiscoveryInterval: 10_000,
+      now: { Date(timeIntervalSince1970: 3_200) },
+      changeObserver: observer
+    )
+    let monitor = CodexSessionActivityMonitor(locator: locator)
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+
+    try fixture.append(start("resumed", startedAt: 3_100), to: file)
+    try fixture.setModificationDate(Date(timeIntervalSince1970: 3_100), for: file)
+    observer.changes.paths.insert(file.path)
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+  }
+
+  @Test
+  func fileSystemObserverReportsAChangedSessionFile() async throws {
+    let fixture = try SessionFixture()
+    let observer = FSEventsCodexSessionFileChangeObserver(sessionRoot: fixture.directory)
+    let file = try fixture.makeRootSession(events: [start("background")])
+    var observedPaths = Set<String>()
+
+    for _ in 0..<40
+    where !observedPaths.contains(where: { URL(fileURLWithPath: $0).lastPathComponent == file.lastPathComponent }) {
+      try await Task.sleep(for: .milliseconds(50))
+      observedPaths.formUnion(observer.takeChanges().paths)
+    }
+
+    #expect(
+      observedPaths.contains {
+        URL(fileURLWithPath: $0).lastPathComponent == file.lastPathComponent
+      }
+    )
+  }
+
+  @Test
   func optInLiveSmokeRecognizesTheCurrentCodexTask() {
     guard ProcessInfo.processInfo.environment["METHAMPHETAMINE_EXPECT_ACTIVE_CODEX"] == "1" else {
       return
@@ -412,6 +513,15 @@ private final class FakeCodexOpenSessionLocator: CodexOpenSessionLocating {
   }
 }
 
+private final class FakeCodexSessionFileChangeObserver: CodexSessionFileChangeObserving {
+  var changes = CodexSessionFileChanges()
+
+  func takeChanges() -> CodexSessionFileChanges {
+    defer { changes = CodexSessionFileChanges() }
+    return changes
+  }
+}
+
 private struct FakeCodexProcessInspector: CodexProcessInspecting {
   let processes: [CodexRuntimeProcess]
   let pathsByProcessID: [pid_t: [String]]
@@ -437,6 +547,8 @@ private final class SessionFixture {
     )
     try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
   }
+
+  var directory: URL { root }
 
   deinit {
     try? fileManager.removeItem(at: root)
@@ -474,5 +586,9 @@ private final class SessionFixture {
     let meta =
       #"{"type":"session_meta","payload":{"id":"root","thread_source":"user"}}"# + "\n"
     try Data((meta + events.joined()).utf8).write(to: url)
+  }
+
+  func setModificationDate(_ date: Date, for url: URL) throws {
+    try fileManager.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
   }
 }

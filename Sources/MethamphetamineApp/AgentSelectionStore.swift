@@ -3,7 +3,6 @@ import Foundation
 @MainActor
 final class AgentProtectionStore {
   private static let key = "agentSleepProtectionEnabled"
-  private static let lowBatterySleepKey = "lowBatterySleepEnabled"
   private static let pendingPowerProtectKey = "pendingPowerProtectEnable"
   private static let legacySelectionKey = "enabledCodingAgentIDs"
   private let defaults: UserDefaults
@@ -28,17 +27,6 @@ final class AgentProtectionStore {
 
   func save(_ isEnabled: Bool) {
     defaults.set(isEnabled, forKey: Self.key)
-  }
-
-  func loadLowBatterySleep(defaultValue: Bool = true) -> Bool {
-    guard defaults.object(forKey: Self.lowBatterySleepKey) != nil else {
-      return defaultValue
-    }
-    return defaults.bool(forKey: Self.lowBatterySleepKey)
-  }
-
-  func saveLowBatterySleep(_ isEnabled: Bool) {
-    defaults.set(isEnabled, forKey: Self.lowBatterySleepKey)
   }
 
   var isPowerProtectSetupPending: Bool {
