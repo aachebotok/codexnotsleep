@@ -32,5 +32,6 @@ struct MethamphetamineApplication: App {
         .accessibilityLabel("Methamphetamine: \(controller.statusTitle)")
     }
     .menuBarExtraStyle(.window)
+    .windowResizability(.contentSize)
   }
 }
