@@ -13,9 +13,10 @@ struct MenuContentView: View {
           )
         ) {
           VStack(alignment: .leading, spacing: 2) {
-            Text("Не засыпать")
+            Text("Не спать")
+              .font(.system(size: 15))
             Text("Пока работает Codex")
-              .font(.caption)
+              .font(.system(size: 13))
               .foregroundStyle(.secondary)
           }
           .frame(maxWidth: .infinity, alignment: .leading)
@@ -26,10 +27,15 @@ struct MenuContentView: View {
 
         Divider()
           .padding(.top, 8)
+          .padding(.bottom, 6)
 
-        Text("Mac сможет уснуть при заряде 10% и ниже")
-          .font(.caption)
-          .foregroundStyle(.secondary)
+        Button("Выйти") {
+          NSApplication.shared.terminate(nil)
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 13))
+        .foregroundStyle(.secondary)
+        .accessibilityHint("Закрывает Methamphetamine и возвращает обычный режим сна")
       }
 
       if let error = controller.visibleError {
@@ -42,7 +48,9 @@ struct MenuContentView: View {
       }
     }
     .frame(width: 288, alignment: .leading)
-    .padding(14)
+    .padding(.horizontal, 14)
+    .padding(.top, 14)
+    .padding(.bottom, 12)
     .onAppear(perform: controller.menuDidOpen)
   }
 }

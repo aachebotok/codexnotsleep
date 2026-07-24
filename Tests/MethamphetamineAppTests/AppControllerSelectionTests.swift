@@ -336,7 +336,9 @@ struct AppControllerProtectionTests {
 
     controller.refreshCodexActivity()
     #expect(backend.isHeld)
-    #expect(controller.visibleError == "Не удалось точно определить задачу Codex.")
+    #expect(controller.visibleError == nil)
+    #expect(controller.menuIcon == "pill.fill")
+    #expect(controller.statusTitle == "Mac защищён от сна")
 
     controller.setProtectionEnabled(false)
     #expect(!backend.isHeld)

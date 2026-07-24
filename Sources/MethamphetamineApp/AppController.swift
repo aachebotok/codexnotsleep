@@ -18,7 +18,6 @@ final class AppController: NSObject, ObservableObject {
   @Published private var setupError: String?
   @Published private var configurationError: String?
   @Published private var launchAtLoginError: String?
-  @Published private var activityWarning: String?
 
   var detectedAgents: [DetectedCodingAgent] = [] {
     didSet { evaluateProtection() }
@@ -114,7 +113,7 @@ final class AppController: NSObject, ObservableObject {
   }
 
   var visibleError: String? {
-    protectionError ?? setupError ?? configurationError ?? launchAtLoginError ?? activityWarning
+    protectionError ?? setupError ?? configurationError ?? launchAtLoginError
   }
 
   var statusTitle: String {
@@ -123,11 +122,6 @@ final class AppController: NSObject, ObservableObject {
     if setupError != nil { return "Не удалось настроить защиту" }
     if configurationError != nil { return "Не удалось обновить старую версию" }
     if launchAtLoginError != nil { return "Не удалось включить автозапуск" }
-    if activityWarning != nil {
-      return codexActivitySnapshot.effectiveActiveCount > 0 && backend.isHeld
-        ? "Codex защищён в резервном режиме"
-        : "Не удалось определить активность Codex"
-    }
     if !isProtectionEnabled { return "Защита от сна выключена" }
 
     switch phase {
@@ -201,16 +195,7 @@ final class AppController: NSObject, ObservableObject {
 
   func refreshCodexActivity() {
     codexActivitySnapshot = codexActivityProvider.refresh()
-    updateActivityWarning()
     evaluateProtection()
-  }
-
-  private func updateActivityWarning() {
-    guard isProtectionEnabled, codexActivitySnapshot.usesFallback else {
-      activityWarning = nil
-      return
-    }
-    activityWarning = "Не удалось точно определить задачу Codex."
   }
 
   func setProtectionEnabled(_ isEnabled: Bool) {
@@ -260,8 +245,6 @@ final class AppController: NSObject, ObservableObject {
     isProtectionEnabled = isEnabled
     protectionStore.save(isEnabled)
     if clearSetupError { setupError = nil }
-    updateActivityWarning()
-
     if isEnabled {
       refreshCodexActivity()
     } else {
