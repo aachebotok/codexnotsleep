@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Foundation
 import MethamphetamineCore
+import MethamphetamineUI
 
 @MainActor
 final class AppController: NSObject, ObservableObject {
@@ -13,11 +14,9 @@ final class AppController: NSObject, ObservableObject {
 
   @Published private(set) var isProtectionEnabled: Bool
   @Published private(set) var isPreparingProtection = false
+  @Published private(set) var isResolvingIssue = false
   @Published private(set) var phase: ProtectionPhase = .idle
-  @Published private var protectionError: String?
-  @Published private var setupError: String?
-  @Published private var configurationError: String?
-  @Published private var launchAtLoginError: String?
+  @Published private(set) var menuIssue: MenuIssue?
 
   var detectedAgents: [DetectedCodingAgent] = [] {
     didSet { evaluateProtection() }
@@ -113,15 +112,12 @@ final class AppController: NSObject, ObservableObject {
   }
 
   var visibleError: String? {
-    protectionError ?? setupError ?? configurationError ?? launchAtLoginError
+    menuIssue?.title
   }
 
   var statusTitle: String {
-    if protectionError != nil { return "Ошибка защиты" }
+    if let menuIssue { return menuIssue.title }
     if isPreparingProtection { return "Настройка защиты" }
-    if setupError != nil { return "Не удалось настроить защиту" }
-    if configurationError != nil { return "Не удалось обновить старую версию" }
-    if launchAtLoginError != nil { return "Не удалось включить автозапуск" }
     if !isProtectionEnabled { return "Защита от сна выключена" }
 
     switch phase {
@@ -135,7 +131,7 @@ final class AppController: NSObject, ObservableObject {
   }
 
   var menuIcon: String {
-    if visibleError != nil { return "exclamationmark.circle.fill" }
+    if menuIssue != nil { return "exclamationmark.circle.fill" }
     return "pill.fill"
   }
 
@@ -153,14 +149,17 @@ final class AppController: NSObject, ObservableObject {
     do {
       try backend.recover()
       recoveryPending = false
-      protectionError = nil
+      menuIssue = nil
     } catch {
       recoveryPending = true
-      protectionError = error.localizedDescription
+      menuIssue = .sleepRestoreRequired
+      logHiddenError("recover sleep", error: error)
     }
 
     migrateLegacyIntegrations()
-    launchAtLoginError = launchAtLoginController.enableByDefault()
+    if let launchAtLoginError = launchAtLoginController.enableByDefault() {
+      NSLog("Methamphetamine launch-at-login issue: %@", launchAtLoginError)
+    }
     if isProtectionEnabled {
       refreshCodexActivity()
     }
@@ -208,7 +207,7 @@ final class AppController: NSObject, ObservableObject {
 
     if backend.requiresSetup {
       isPreparingProtection = true
-      setupError = nil
+      menuIssue = nil
       Task { @MainActor [weak self] in
         guard let self else { return }
         do {
@@ -223,13 +222,16 @@ final class AppController: NSObject, ObservableObject {
           applyProtectionPreference(true)
         } catch {
           isPreparingProtection = false
-          if let powerProtectError = error as? PowerProtectError,
-            powerProtectError == .setupCancelled
-          {
+          let setupWasCancelled =
+            (error as? PowerProtectError) == .setupCancelled
+          if setupWasCancelled {
             protectionStore.clearPowerProtectSetupPending()
           }
-          setupError = error.localizedDescription
-          applyProtectionPreference(false, clearSetupError: false)
+          applyProtectionPreference(false)
+          menuIssue = setupWasCancelled ? nil : .permissionRequired
+          if !setupWasCancelled {
+            logHiddenError("configure closed-lid protection", error: error)
+          }
         }
       }
     } else {
@@ -238,14 +240,21 @@ final class AppController: NSObject, ObservableObject {
     }
   }
 
-  private func applyProtectionPreference(
-    _ isEnabled: Bool,
-    clearSetupError: Bool = true
-  ) {
+  func resolveMenuIssue() {
+    guard let menuIssue, !isResolvingIssue else { return }
+    switch menuIssue {
+    case .permissionRequired:
+      setProtectionEnabled(true)
+    case .sleepRestoreRequired:
+      restoreSleepFromMenu()
+    }
+  }
+
+  private func applyProtectionPreference(_ isEnabled: Bool) {
     isProtectionEnabled = isEnabled
     protectionStore.save(isEnabled)
-    if clearSetupError { setupError = nil }
     if isEnabled {
+      menuIssue = nil
       refreshCodexActivity()
     } else {
       codexActivityProvider.reset()
@@ -259,9 +268,11 @@ final class AppController: NSObject, ObservableObject {
       do {
         try backend.release()
         lastBackendRenewAt = .distantPast
-        protectionError = nil
+        recoveryPending = false
+        menuIssue = nil
       } catch {
-        protectionError = error.localizedDescription
+        menuIssue = .sleepRestoreRequired
+        logHiddenError("restore sleep after disabling protection", error: error)
       }
       phase = .idle
     }
@@ -272,10 +283,11 @@ final class AppController: NSObject, ObservableObject {
       do {
         try backend.recover()
         recoveryPending = false
-        protectionError = nil
+        menuIssue = nil
       } catch {
         phase = .idle
-        protectionError = error.localizedDescription
+        menuIssue = .sleepRestoreRequired
+        logHiddenError("retry sleep recovery", error: error)
         return
       }
     }
@@ -295,9 +307,11 @@ final class AppController: NSObject, ObservableObject {
         do {
           try backend.release()
           lastBackendRenewAt = .distantPast
-          protectionError = nil
+          recoveryPending = false
+          menuIssue = nil
         } catch {
-          protectionError = error.localizedDescription
+          menuIssue = .sleepRestoreRequired
+          logHiddenError("restore sleep", error: error)
         }
       }
       phase = .idle
@@ -320,15 +334,21 @@ final class AppController: NSObject, ObservableObject {
           try backend.acquire()
           lastBackendRenewAt = now
         }
-        protectionError = nil
+        menuIssue = nil
       } catch {
         let activationError = error
         do {
           try backend.release()
           lastBackendRenewAt = .distantPast
-          protectionError = activationError.localizedDescription
+          if (activationError as? PowerProtectError) == .setupRequired {
+            menuIssue = .permissionRequired
+          } else {
+            menuIssue = nil
+            logHiddenError("activate protection", error: activationError)
+          }
         } catch {
-          protectionError = error.localizedDescription
+          menuIssue = .sleepRestoreRequired
+          logHiddenError("restore sleep after activation failure", error: error)
         }
       }
     } else {
@@ -336,9 +356,11 @@ final class AppController: NSObject, ObservableObject {
         do {
           try backend.release()
           lastBackendRenewAt = .distantPast
-          protectionError = nil
+          recoveryPending = false
+          menuIssue = nil
         } catch {
-          protectionError = error.localizedDescription
+          menuIssue = .sleepRestoreRequired
+          logHiddenError("restore sleep after task completion", error: error)
         }
       }
     }
@@ -361,14 +383,38 @@ final class AppController: NSObject, ObservableObject {
       }
     }
 
-    configurationError =
-      failures.isEmpty
-      ? nil
-      : "Не удалось убрать старую интеграцию: \(failures.joined(separator: ", "))"
-
     if failures.isEmpty {
       defaults.set(Self.legacyMigrationVersion, forKey: Self.legacyMigrationVersionKey)
+    } else {
+      NSLog(
+        "Methamphetamine could not remove legacy integrations: %@",
+        failures.joined(separator: ", ")
+      )
     }
+  }
+
+  private func restoreSleepFromMenu() {
+    isResolvingIssue = true
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer { isResolvingIssue = false }
+      do {
+        if backend.requiresSetup {
+          try await backend.prepare()
+        }
+        try backend.release()
+        recoveryPending = false
+        lastBackendRenewAt = .distantPast
+        menuIssue = nil
+      } catch {
+        menuIssue = .sleepRestoreRequired
+        logHiddenError("restore sleep from menu", error: error)
+      }
+    }
+  }
+
+  private func logHiddenError(_ operation: String, error: Error) {
+    NSLog("Methamphetamine failed to %@: %@", operation, error.localizedDescription)
   }
 
   @objc

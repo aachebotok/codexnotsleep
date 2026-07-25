@@ -382,7 +382,6 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend {
 
   func recover() throws {
     guard leaseStore.hasLease else { return }
-    guard !requiresSetup else { throw PowerProtectError.setupRequired }
     try restoreSleep()
   }
 
@@ -458,11 +457,13 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend {
   }
 
   private func restoreSleep() throws {
-    guard !requiresSetup else { throw PowerProtectError.setupRequired }
     do {
-      try setSleepDisabled(false)
-      guard try !sleepIsDisabled() else {
-        throw PowerProtectError.stateVerificationFailed
+      if try sleepIsDisabled() {
+        guard !requiresSetup else { throw PowerProtectError.setupRequired }
+        try setSleepDisabled(false)
+        guard try !sleepIsDisabled() else {
+          throw PowerProtectError.stateVerificationFailed
+        }
       }
       try leaseStore.finish()
       watchdog.stop()
@@ -495,7 +496,7 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend {
         return value == "1"
       }
     }
-    throw PowerProtectError.stateVerificationFailed
+    return false
   }
 }
 

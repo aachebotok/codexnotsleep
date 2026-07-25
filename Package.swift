@@ -6,13 +6,16 @@ let package = Package(
   platforms: [.macOS(.v13)],
   products: [
     .library(name: "MethamphetamineCore", targets: ["MethamphetamineCore"]),
+    .library(name: "MethamphetamineUI", targets: ["MethamphetamineUI"]),
     .executable(name: "Methamphetamine", targets: ["MethamphetamineApp"]),
+    .executable(name: "MethamphetamineStorybook", targets: ["MethamphetamineStorybook"]),
   ],
   targets: [
     .target(name: "MethamphetamineCore"),
+    .target(name: "MethamphetamineUI"),
     .executableTarget(
       name: "MethamphetamineApp",
-      dependencies: ["MethamphetamineCore"],
+      dependencies: ["MethamphetamineCore", "MethamphetamineUI"],
       linkerSettings: [
         .linkedFramework("AppKit"),
         .linkedFramework("IOKit"),
@@ -20,9 +23,15 @@ let package = Package(
         .linkedFramework("ServiceManagement"),
       ]
     ),
+    .executableTarget(
+      name: "MethamphetamineStorybook",
+      dependencies: ["MethamphetamineUI"],
+      linkerSettings: [.linkedFramework("AppKit")]
+    ),
     .testTarget(name: "MethamphetamineCoreTests", dependencies: ["MethamphetamineCore"]),
     .testTarget(
-      name: "MethamphetamineAppTests", dependencies: ["MethamphetamineApp", "MethamphetamineCore"]),
+      name: "MethamphetamineAppTests",
+      dependencies: ["MethamphetamineApp", "MethamphetamineCore", "MethamphetamineUI"]),
   ],
   swiftLanguageModes: [.v6]
 )

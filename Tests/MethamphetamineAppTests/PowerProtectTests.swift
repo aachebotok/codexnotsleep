@@ -12,7 +12,7 @@ struct PowerProtectTests {
     let fixture = try Fixture(
       results: [
         Self.pmsetState(false), Self.commandSucceeded(), Self.pmsetState(true),
-        Self.commandSucceeded(), Self.pmsetState(false),
+        Self.pmsetState(true), Self.commandSucceeded(), Self.pmsetState(false),
       ]
     )
     defer { fixture.cleanup() }
@@ -32,6 +32,7 @@ struct PowerProtectTests {
       fixture.runner.invocations.map { $0.arguments } == [
         ["-g"],
         ["-n", "/usr/bin/pmset", "-a", "disablesleep", "1"],
+        ["-g"],
         ["-g"],
         ["-n", "/usr/bin/pmset", "-a", "disablesleep", "0"],
         ["-g"],
@@ -58,7 +59,7 @@ struct PowerProtectTests {
       results: [
         Self.pmsetState(false), Self.commandSucceeded(), Self.pmsetState(true),
         Self.pmsetState(false), Self.commandSucceeded(), Self.pmsetState(true),
-        Self.commandSucceeded(), Self.pmsetState(false),
+        Self.pmsetState(true), Self.commandSucceeded(), Self.pmsetState(false),
       ]
     )
     defer { fixture.cleanup() }
@@ -80,7 +81,7 @@ struct PowerProtectTests {
       results: [
         Self.pmsetState(true), Self.pmsetState(false),
         Self.commandSucceeded(), Self.pmsetState(true),
-        Self.commandSucceeded(), Self.pmsetState(false),
+        Self.pmsetState(true), Self.commandSucceeded(), Self.pmsetState(false),
       ]
     )
     defer { fixture.cleanup() }
@@ -102,8 +103,8 @@ struct PowerProtectTests {
     let fixture = try Fixture(
       results: [
         Self.pmsetState(false), Self.commandSucceeded(), Self.pmsetState(true),
-        Self.commandFailed(),
-        Self.commandSucceeded(), Self.pmsetState(false),
+        Self.pmsetState(true), Self.commandFailed(),
+        Self.pmsetState(true), Self.commandSucceeded(), Self.pmsetState(false),
       ]
     )
     defer { fixture.cleanup() }
@@ -129,9 +130,7 @@ struct PowerProtectTests {
 
   @Test
   func staleLeaseIsRecoveredBeforeNewProtection() throws {
-    let fixture = try Fixture(
-      results: [Self.commandSucceeded(), Self.pmsetState(false)]
-    )
+    let fixture = try Fixture(results: [Self.pmsetState(false)])
     defer { fixture.cleanup() }
     _ = try fixture.leaseStore.begin()
     let backend = PMSetPowerProtectBackend(
@@ -147,6 +146,33 @@ struct PowerProtectTests {
 
     #expect(!backend.isHeld)
     #expect(!fixture.leaseStore.hasLease)
+    #expect(fixture.runner.invocations.map(\.arguments) == [["-g"]])
+  }
+
+  @Test
+  func alreadyEnabledSleepClearsLeaseWithoutInstalledPermission() throws {
+    let fixture = try Fixture(
+      results: [
+        PowerProtectCommandResult(
+          status: 0,
+          output: "System-wide power settings:\n"
+        )
+      ]
+    )
+    defer { fixture.cleanup() }
+    _ = try fixture.leaseStore.begin()
+    let backend = PMSetPowerProtectBackend(
+      installer: FakePowerProtectInstaller(isInstalled: false),
+      runner: fixture.runner,
+      leaseStore: fixture.leaseStore,
+      watchdog: fixture.watchdog
+    )
+
+    try backend.recover()
+
+    #expect(!backend.isHeld)
+    #expect(!fixture.leaseStore.hasLease)
+    #expect(fixture.runner.invocations.map(\.arguments) == [["-g"]])
   }
 
   @Test

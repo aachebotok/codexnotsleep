@@ -1,5 +1,6 @@
 import Foundation
 import MethamphetamineCore
+import MethamphetamineUI
 import Testing
 
 @testable import MethamphetamineApp
@@ -134,7 +135,38 @@ struct AppControllerProtectionTests {
     #expect(controller.isProtectionEnabled)
     #expect(backend.prepareCount == 1)
     #expect(backend.recoverCount == 1)
+    #expect(controller.menuIssue == nil)
     #expect(defaults.bool(forKey: "agentSleepProtectionEnabled"))
+  }
+
+  @Test
+  func failedSetupOffersARepeatablePermissionAction() async throws {
+    let suiteName = "Methamphetamine.FailedSetupTests.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    defaults.set(false, forKey: "agentSleepProtectionEnabled")
+
+    let fixtureHome = FileManager.default.temporaryDirectory
+      .appending(path: "Methamphetamine.FailedSetupTests.\(UUID().uuidString)")
+    let backend = SetupSleepProtectionBackend(
+      requiresSetup: true,
+      prepareError: PowerProtectError.setupFailed
+    )
+    let controller = AppController(
+      defaults: defaults,
+      detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
+      legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
+      backend: backend,
+      startsAutomatically: false
+    )
+
+    controller.setProtectionEnabled(true)
+    while controller.isPreparingProtection {
+      await Task.yield()
+    }
+
+    #expect(!controller.isProtectionEnabled)
+    #expect(controller.menuIssue == .permissionRequired)
   }
 
   @Test
@@ -166,6 +198,7 @@ struct AppControllerProtectionTests {
 
     #expect(!controller.isProtectionEnabled)
     #expect(!defaults.bool(forKey: "pendingPowerProtectEnable"))
+    #expect(controller.menuIssue == nil)
   }
 
   @Test
@@ -190,6 +223,8 @@ struct AppControllerProtectionTests {
     )
     controller.start()
 
+    #expect(controller.menuIssue == .sleepRestoreRequired)
+
     let definition = CodingAgentDefinition(
       id: "test-agent",
       displayName: "Test Agent",
@@ -209,6 +244,7 @@ struct AppControllerProtectionTests {
 
     #expect(backend.acquireCount == 1)
     #expect(backend.isHeld)
+    #expect(controller.menuIssue == nil)
   }
 
   @Test
@@ -405,7 +441,7 @@ struct AppControllerProtectionTests {
     controller.setProtectionEnabled(false)
     #expect(backend.isHeld)
     #expect(backend.releaseAttempts == 1)
-    #expect(controller.visibleError != nil)
+    #expect(controller.menuIssue == .sleepRestoreRequired)
     #expect(activity.resetCount == 1)
 
     let refreshCount = activity.refreshCount
@@ -413,7 +449,7 @@ struct AppControllerProtectionTests {
 
     #expect(!backend.isHeld)
     #expect(backend.releaseAttempts == 2)
-    #expect(controller.visibleError == nil)
+    #expect(controller.menuIssue == nil)
     #expect(activity.refreshCount == refreshCount)
   }
 
