@@ -20,7 +20,7 @@ public enum MenuIssue: Equatable, Identifiable {
     case .permissionRequired:
       "Нужен пароль администратора"
     case .sleepRestoreRequired:
-      "Mac снова сможет засыпать"
+      "Чтобы Mac снова нормально засыпал"
     }
   }
 }
