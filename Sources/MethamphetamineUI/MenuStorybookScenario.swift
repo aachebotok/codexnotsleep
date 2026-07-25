@@ -74,8 +74,8 @@ struct MenuStorybookScenario: Identifiable {
     ),
     .init(
       id: "permission",
-      title: "Нет разрешения",
-      note: "Можно повторить настройку",
+      title: "Нужно разрешение",
+      note: "Чтобы Mac работал с закрытой крышкой",
       state: .init(
         isProtectionEnabled: false,
         isPreparingProtection: false,

@@ -11,7 +11,7 @@ public enum MenuIssue: Equatable, Identifiable {
     case .permissionRequired:
       "Работа с закрытой крышкой"
     case .sleepRestoreRequired:
-      "Вернуть режим сна"
+      "Исправить сбой сна"
     }
   }
 
@@ -20,7 +20,7 @@ public enum MenuIssue: Equatable, Identifiable {
     case .permissionRequired:
       "Нужен пароль администратора"
     case .sleepRestoreRequired:
-      "Сейчас Mac не засыпает"
+      "Mac снова сможет засыпать"
     }
   }
 }
