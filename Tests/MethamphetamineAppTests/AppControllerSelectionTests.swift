@@ -374,7 +374,7 @@ struct AppControllerProtectionTests {
     #expect(backend.isHeld)
     #expect(controller.visibleError == nil)
     #expect(controller.menuIcon == "pill.fill")
-    #expect(controller.statusTitle == "Mac защищён от сна")
+    #expect(controller.statusTitle == "Preventing sleep")
 
     controller.setProtectionEnabled(false)
     #expect(!backend.isHeld)

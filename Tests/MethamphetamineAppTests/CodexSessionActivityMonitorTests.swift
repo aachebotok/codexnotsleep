@@ -98,6 +98,38 @@ struct CodexSessionActivityMonitorTests {
     #expect(monitor.refresh() == .idle)
   }
 
+  @Test
+  func stalledActiveTurnStopsHoldingProtection() throws {
+    let fixture = try SessionFixture()
+    let file = try fixture.makeRootSession(events: [start("A")])
+    let locator = FakeCodexOpenSessionLocator(files: [owned(file)])
+    var currentTime = Date(timeIntervalSince1970: 10_000)
+    let monitor = CodexSessionActivityMonitor(locator: locator, now: { currentTime })
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+
+    currentTime = currentTime.addingTimeInterval(60 * 60)
+
+    #expect(monitor.refresh() == .idle)
+  }
+
+  @Test
+  func stalledTurnRevivesWhenFileGrowsAgain() throws {
+    let fixture = try SessionFixture()
+    let file = try fixture.makeRootSession(events: [start("A")])
+    let locator = FakeCodexOpenSessionLocator(files: [owned(file)])
+    var currentTime = Date(timeIntervalSince1970: 10_000)
+    let monitor = CodexSessionActivityMonitor(locator: locator, now: { currentTime })
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+    currentTime = currentTime.addingTimeInterval(60 * 60)
+    #expect(monitor.refresh() == .idle)
+
+    try fixture.append(noise, to: file)
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+  }
+
   @Test(arguments: ["interrupted", "replaced", "review_ended", "budget_limited"])
   func everyCodexAbortReasonCompletesTheTask(_ reason: String) throws {
     let fixture = try SessionFixture()
@@ -246,12 +278,114 @@ struct CodexSessionActivityMonitorTests {
   }
 
   @Test
+  func reliableRuntimeWithoutSessionsExpiresIntoIdle() {
+    let locator = FakeCodexOpenSessionLocator(files: [])
+    var currentTime = Date(timeIntervalSince1970: 10_000)
+    let monitor = CodexSessionActivityMonitor(locator: locator, now: { currentTime })
+
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+    currentTime = currentTime.addingTimeInterval(15 * 60 - 1)
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+    currentTime = currentTime.addingTimeInterval(1)
+    #expect(monitor.refresh() == .idle)
+  }
+
+  @Test
+  func findingASessionResetsTheEmptyRuntimeTimeout() throws {
+    let fixture = try SessionFixture()
+    let file = try fixture.makeRootSession(events: [start("A")])
+    let locator = FakeCodexOpenSessionLocator(files: [])
+    var currentTime = Date(timeIntervalSince1970: 10_000)
+    let monitor = CodexSessionActivityMonitor(locator: locator, now: { currentTime })
+
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+    currentTime = currentTime.addingTimeInterval(15 * 60)
+    #expect(monitor.refresh() == .idle)
+
+    locator.inventory = CodexOpenSessionInventory(
+      hasCodexRuntime: true,
+      files: [owned(file)],
+      isReliable: true
+    )
+    #expect(monitor.refresh() == .active(turnCount: 1))
+
+    locator.inventory = CodexOpenSessionInventory(
+      hasCodexRuntime: true,
+      files: [],
+      isReliable: true
+    )
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+  }
+
+  @Test
+  func unreliableRuntimeWithoutSessionsStaysConservative() {
+    let locator = FakeCodexOpenSessionLocator(files: [])
+    locator.inventory = CodexOpenSessionInventory(
+      hasCodexRuntime: true,
+      files: [],
+      isReliable: false
+    )
+    var currentTime = Date(timeIntervalSince1970: 10_000)
+    let monitor = CodexSessionActivityMonitor(locator: locator, now: { currentTime })
+
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+    currentTime = currentTime.addingTimeInterval(60 * 60)
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+  }
+
+  @Test
   func rootWithoutSupportedLifecycleUsesConservativeFallback() throws {
     let fixture = try SessionFixture()
     let file = try fixture.makeRootSession(events: [noise])
     let locator = FakeCodexOpenSessionLocator(files: [owned(file)])
     let monitor = CodexSessionActivityMonitor(locator: locator)
 
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+  }
+
+  @Test
+  func rootWithoutSupportedLifecycleExpiresIntoIdle() throws {
+    let fixture = try SessionFixture()
+    let file = try fixture.makeRootSession(events: [noise])
+    let locator = FakeCodexOpenSessionLocator(files: [owned(file)])
+    var currentTime = Date(timeIntervalSince1970: 10_000)
+    let monitor = CodexSessionActivityMonitor(locator: locator, now: { currentTime })
+
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+    currentTime = currentTime.addingTimeInterval(15 * 60)
+    #expect(monitor.refresh() == .idle)
+  }
+
+  @Test
+  func quietMalformedSessionExpiresIntoIdle() throws {
+    let fixture = try SessionFixture()
+    let malformed =
+      #"{"type":"event_msg","payload":{"type":"task_started","started_at":2000}}"# + "\n"
+    let file = try fixture.makeRootSession(events: [malformed])
+    let locator = FakeCodexOpenSessionLocator(files: [owned(file)])
+    var currentTime = Date(timeIntervalSince1970: 10_000)
+    let monitor = CodexSessionActivityMonitor(locator: locator, now: { currentTime })
+
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+    currentTime = currentTime.addingTimeInterval(15 * 60)
+    #expect(monitor.refresh() == .idle)
+  }
+
+  @Test
+  func growingMalformedSessionRenewsConservativeFallback() throws {
+    let fixture = try SessionFixture()
+    let malformed =
+      #"{"type":"event_msg","payload":{"type":"task_started","started_at":2000}}"# + "\n"
+    let file = try fixture.makeRootSession(events: [malformed])
+    let locator = FakeCodexOpenSessionLocator(files: [owned(file)])
+    var currentTime = Date(timeIntervalSince1970: 10_000)
+    let monitor = CodexSessionActivityMonitor(locator: locator, now: { currentTime })
+
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+    currentTime = currentTime.addingTimeInterval(15 * 60)
+    try fixture.append(malformed, to: file)
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+    currentTime = currentTime.addingTimeInterval(15 * 60 - 1)
     #expect(monitor.refresh() == .unavailable(protectConservatively: true))
   }
 
@@ -448,10 +582,21 @@ struct CodexSessionActivityMonitorTests {
       return
     }
 
-    let monitor = CodexSessionActivityMonitor()
-    let liveSnapshot = monitor.refresh()
-    #expect(liveSnapshot.effectiveActiveCount > 0)
-    #expect(!liveSnapshot.usesFallback)
+    let root = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".codex/sessions")
+    var currentTime = Date.now
+    let monitor = CodexSessionActivityMonitor(
+      locator: LibprocCodexOpenSessionLocator(sessionRoot: root),
+      now: { currentTime }
+    )
+    let initialSnapshot = monitor.refresh()
+    #expect(initialSnapshot.effectiveActiveCount > 0)
+
+    if initialSnapshot.usesFallback {
+      currentTime = currentTime.addingTimeInterval(15 * 60)
+    }
+    let settledSnapshot = monitor.refresh()
+    #expect(settledSnapshot.effectiveActiveCount > 0)
+    #expect(!settledSnapshot.usesFallback)
   }
 
   private func owned(_ url: URL) -> CodexOpenSessionFile {

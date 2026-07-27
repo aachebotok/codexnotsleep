@@ -35,9 +35,9 @@ public struct MenuPanelView: View {
       } else {
         Toggle(isOn: $isProtectionEnabled) {
           VStack(alignment: .leading, spacing: 2) {
-            Text("Не спать")
+            Text("Stay awake")
               .font(.system(size: 15))
-            Text("Пока работает Codex")
+            Text("While Codex is working")
               .font(.system(size: 13))
               .foregroundStyle(.secondary)
           }
@@ -45,18 +45,18 @@ public struct MenuPanelView: View {
         }
         .toggleStyle(.switch)
         .disabled(isPreparingProtection)
-        .accessibilityHint("Mac не засыпает во время активной задачи Codex")
+        .accessibilityHint("Prevents your Mac from sleeping during an active Codex task")
       }
 
       Divider()
         .padding(.top, 8)
         .padding(.bottom, 6)
 
-      Button("Выйти", action: quitAction)
+      Button("Quit", action: quitAction)
         .buttonStyle(.plain)
         .font(.system(size: 13))
         .foregroundStyle(.secondary)
-        .accessibilityHint("Закрывает Methamphetamine и возвращает обычный режим сна")
+        .accessibilityHint("Quits Methamphetamine and restores normal sleep")
     }
     .frame(width: 288, alignment: .leading)
     .padding(.horizontal, 14)

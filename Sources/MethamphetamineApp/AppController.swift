@@ -33,6 +33,7 @@ final class AppController: NSObject, ObservableObject {
   private var codexActivitySnapshot: CodexActivitySnapshot
   private var policy: SleepPolicyMachine
   private var timer: Timer?
+  private var activityToken: NSObjectProtocol?
   private var lastBackendRenewAt = Date.distantPast
   private var started = false
   private var recoveryPending = false
@@ -65,7 +66,7 @@ final class AppController: NSObject, ObservableObject {
     batteryStatusProvider: BatteryStatusProviding = IOKitBatteryStatusProvider(),
     codexActivityProvider: CodexActivityProviding = CodexSessionActivityMonitor(),
     launchAtLoginController: any LaunchAtLoginControlling = NoOpLaunchAtLoginController(),
-    protectionGraceSeconds: TimeInterval = 3,
+    protectionGraceSeconds: TimeInterval = 15,
     startsAutomatically: Bool
   ) {
     let protectionStore = AgentProtectionStore(defaults: defaults)
@@ -117,16 +118,16 @@ final class AppController: NSObject, ObservableObject {
 
   var statusTitle: String {
     if let menuIssue { return menuIssue.title }
-    if isPreparingProtection { return "Настройка защиты" }
-    if !isProtectionEnabled { return "Защита от сна выключена" }
+    if isPreparingProtection { return "Setting up sleep protection" }
+    if !isProtectionEnabled { return "Sleep protection is off" }
 
     switch phase {
     case .idle:
-      return "Ожидание"
+      return "Waiting"
     case .protected:
-      return "Mac защищён от сна"
+      return "Preventing sleep"
     case .grace:
-      return "Период завершения"
+      return "Finishing up"
     }
   }
 
@@ -164,14 +165,21 @@ final class AppController: NSObject, ObservableObject {
       refreshCodexActivity()
     }
 
-    timer = Timer.scheduledTimer(
-      withTimeInterval: Self.activityRefreshInterval,
+    activityToken = ProcessInfo.processInfo.beginActivity(
+      options: .userInitiatedAllowingIdleSystemSleep,
+      reason: "Monitor Codex task activity"
+    )
+    let activityTimer = Timer(
+      timeInterval: Self.activityRefreshInterval,
       repeats: true
     ) { [weak self] _ in
       Task { @MainActor in
         self?.tick()
       }
     }
+    activityTimer.tolerance = 0.2
+    RunLoop.main.add(activityTimer, forMode: .common)
+    timer = activityTimer
   }
 
   func menuDidOpen() {
@@ -427,6 +435,10 @@ final class AppController: NSObject, ObservableObject {
     started = false
     timer?.invalidate()
     timer = nil
+    if let activityToken {
+      ProcessInfo.processInfo.endActivity(activityToken)
+      self.activityToken = nil
+    }
     do {
       try backend.release()
     } catch {

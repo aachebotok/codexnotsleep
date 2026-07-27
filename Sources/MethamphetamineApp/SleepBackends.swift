@@ -8,7 +8,7 @@ enum BackendError: LocalizedError {
   var errorDescription: String? {
     switch self {
     case .assertionFailed(let code):
-      "Не удалось запретить автоматический сон: \(code)"
+      "Couldn't prevent automatic sleep: \(code)"
     }
   }
 }

@@ -199,7 +199,7 @@ struct PowerProtectTests {
     let appleScript = try #require(authorizationRunner.scripts.first)
     #expect(
       appleScript.contains(
-        "with prompt \"Разрешите Mac работать с закрытой крышкой. Подтверждение потребуется один раз.\""
+        "with prompt \"Allow Methamphetamine to keep your Mac running with the lid closed. You'll only need to confirm once.\""
       ))
     var compilationError: NSDictionary?
     let compiled = NSAppleScript(source: appleScript)?.compileAndReturnError(&compilationError)

@@ -9,18 +9,18 @@ public enum MenuIssue: Equatable, Identifiable {
   public var title: String {
     switch self {
     case .permissionRequired:
-      "Работа с закрытой крышкой"
+      "Use with lid closed"
     case .sleepRestoreRequired:
-      "Исправить сбой сна"
+      "Fix sleep issue"
     }
   }
 
   var message: String {
     switch self {
     case .permissionRequired:
-      "Нужен пароль администратора"
+      "Administrator password required"
     case .sleepRestoreRequired:
-      "Чтобы Mac снова нормально засыпал"
+      "So your Mac can sleep normally again"
     }
   }
 }

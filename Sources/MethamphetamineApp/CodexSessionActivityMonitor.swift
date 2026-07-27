@@ -68,7 +68,7 @@ enum CodexOpenSessionLocatorError: LocalizedError {
   var errorDescription: String? {
     switch self {
     case .processInventoryUnavailable:
-      "Не удалось прочитать процессы Codex"
+      "Couldn't read Codex processes"
     }
   }
 }
@@ -690,8 +690,20 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     var currentTurnID: String?
     var currentTurnStartedAt: Date?
     var hasObservedSupportedLifecycle: Bool
+    var lastGrowthAt: Date
 
     var isActive: Bool { currentTurnID != nil }
+
+    func isStalled(now: Date) -> Bool {
+      isActive && now.timeIntervalSince(lastGrowthAt) >= Self.activeTurnLivenessWindow
+    }
+
+    private static let activeTurnLivenessWindow: TimeInterval = 60 * 60
+  }
+
+  private struct FailureLiveness {
+    var size: UInt64
+    var changedAt: Date
   }
 
   private static let reverseScanChunkSize = 64 * 1_024
@@ -701,10 +713,15 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
   private static let maximumLinePrefixBytes = 4 * 1_024
   private static let sessionPrefixSize = 16 * 1_024
   private static let processStartTolerance: TimeInterval = 5
+  private static let failedFileLivenessWindow: TimeInterval = 15 * 60
+  private static let emptyRuntimeLivenessWindow: TimeInterval = 15 * 60
 
   private let locator: CodexOpenSessionLocating
   private let fileManager: FileManager
+  private let now: () -> Date
   private var states: [String: FileState] = [:]
+  private var failureLiveness: [String: FailureLiveness] = [:]
+  private var emptyInventorySince: Date?
   private var lastKnownRuntime = false
 
   private(set) var snapshot: CodexActivitySnapshot = .idle
@@ -716,17 +733,25 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     let root = homeDirectory.appending(path: ".codex/sessions")
     self.init(
       locator: LibprocCodexOpenSessionLocator(sessionRoot: root),
-      fileManager: fileManager
+      fileManager: fileManager,
+      now: Date.init
     )
   }
 
-  init(locator: CodexOpenSessionLocating, fileManager: FileManager = .default) {
+  init(
+    locator: CodexOpenSessionLocating,
+    fileManager: FileManager = .default,
+    now: @escaping () -> Date = Date.init
+  ) {
     self.locator = locator
     self.fileManager = fileManager
+    self.now = now
   }
 
   func reset() {
     states.removeAll()
+    failureLiveness.removeAll()
+    emptyInventorySince = nil
     lastKnownRuntime = false
     snapshot = .idle
   }
@@ -745,20 +770,40 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     lastKnownRuntime = inventory.hasCodexRuntime
     guard inventory.hasCodexRuntime else {
       states.removeAll()
+      failureLiveness.removeAll()
+      emptyInventorySince = nil
       snapshot = .idle
       return snapshot
     }
 
     guard !inventory.files.isEmpty else {
       states.removeAll()
-      snapshot = .unavailable(protectConservatively: true)
+      failureLiveness.removeAll()
+      guard inventory.isReliable else {
+        emptyInventorySince = nil
+        snapshot = .unavailable(protectConservatively: true)
+        return snapshot
+      }
+
+      let currentTime = now()
+      let emptySince = emptyInventorySince ?? currentTime
+      emptyInventorySince = emptySince
+      let isStillLive =
+        currentTime.timeIntervalSince(emptySince) < Self.emptyRuntimeLivenessWindow
+      snapshot = isStillLive
+        ? .unavailable(protectConservatively: true)
+        : .idle
       return snapshot
     }
 
+    emptyInventorySince = nil
+
     let openPaths = Set(inventory.files.map { $0.url.standardizedFileURL.path })
     states = states.filter { openPaths.contains($0.key) }
+    failureLiveness = failureLiveness.filter { openPaths.contains($0.key) }
 
-    var hadFailure = !inventory.isReliable
+    let currentTime = now()
+    var hasLiveFileFailure = false
     for openFile in inventory.files {
       let path = openFile.url.standardizedFileURL.path
       do {
@@ -768,10 +813,12 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
           try update(&state, from: openFile.url)
           discardStaleTurnIfNeeded(in: &state)
           states[path] = state
+          failureLiveness.removeValue(forKey: path)
         } else {
           switch try sessionKind(at: openFile.url) {
           case .child:
             states.removeValue(forKey: path)
+            failureLiveness.removeValue(forKey: path)
           case .root:
             var state = try bootstrap(
               url: openFile.url,
@@ -780,23 +827,33 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
             )
             discardStaleTurnIfNeeded(in: &state)
             states[path] = state
+            failureLiveness.removeValue(forKey: path)
           case .unknown:
             states.removeValue(forKey: path)
-            hadFailure = true
+            hasLiveFileFailure = failureIsLive(
+              at: openFile.url,
+              currentTime: currentTime
+            ) || hasLiveFileFailure
           }
         }
       } catch {
-        hadFailure = true
+        hasLiveFileFailure = failureIsLive(
+          at: openFile.url,
+          currentTime: currentTime
+        ) || hasLiveFileFailure
       }
     }
 
-    if states.isEmpty
-      || states.values.contains(where: { !$0.hasObservedSupportedLifecycle })
-    {
-      hadFailure = true
+    let hasLiveUnknownState = states.values.contains {
+      !$0.hasObservedSupportedLifecycle
+        && currentTime.timeIntervalSince($0.lastGrowthAt)
+          < Self.failedFileLivenessWindow
     }
-
-    let activeCount = states.values.count(where: \FileState.isActive)
+    let hadFailure =
+      !inventory.isReliable || hasLiveFileFailure || hasLiveUnknownState
+    let activeCount = states.values.count {
+      $0.isActive && !$0.isStalled(now: currentTime)
+    }
     if hadFailure {
       snapshot = .unavailable(
         protectConservatively: activeCount > 0 || inventory.hasCodexRuntime
@@ -807,6 +864,34 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       snapshot = .idle
     }
     return snapshot
+  }
+
+  private func failureIsLive(at url: URL, currentTime: Date) -> Bool {
+    let path = url.standardizedFileURL.path
+    do {
+      let attributes = try fileManager.attributesOfItem(atPath: path)
+      guard let number = attributes[.size] as? NSNumber else {
+        throw CocoaError(.fileReadUnknown)
+      }
+      let size = number.uint64Value
+      if let previous = failureLiveness[path], previous.size == size {
+        return currentTime.timeIntervalSince(previous.changedAt)
+          < Self.failedFileLivenessWindow
+      }
+      failureLiveness[path] = FailureLiveness(size: size, changedAt: currentTime)
+      return true
+    } catch {
+      guard fileManager.fileExists(atPath: path) else {
+        failureLiveness.removeValue(forKey: path)
+        return false
+      }
+      let previousSize = failureLiveness[path]?.size ?? 0
+      failureLiveness[path] = FailureLiveness(
+        size: previousSize,
+        changedAt: currentTime
+      )
+      return true
+    }
   }
 
   private func sessionKind(at url: URL) throws -> SessionKind {
@@ -850,7 +935,8 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       ownerStartedAt: ownerStartedAt,
       currentTurnID: lifecycle.currentTurnID,
       currentTurnStartedAt: lifecycle.currentTurnStartedAt,
-      hasObservedSupportedLifecycle: lifecycle.hasObservedSupportedLifecycle
+      hasObservedSupportedLifecycle: lifecycle.hasObservedSupportedLifecycle,
+      lastGrowthAt: now()
     )
   }
 
@@ -867,6 +953,8 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       return
     }
     guard endOffset > state.processedOffset else { return }
+
+    state.lastGrowthAt = now()
 
     try handle.seek(toOffset: state.processedOffset)
     var remaining = min(

@@ -15,17 +15,17 @@ enum PowerProtectError: LocalizedError, Equatable {
   var errorDescription: String? {
     switch self {
     case .setupCancelled:
-      "Настройка отменена"
+      "Setup canceled"
     case .setupFailed, .setupVerificationFailed:
-      "Не удалось настроить работу с закрытой крышкой"
+      "Couldn't set up closed-lid operation"
     case .setupRequired:
-      "Для работы с закрытой крышкой нужна разовая настройка"
+      "Closed-lid operation requires a one-time setup"
     case .commandFailed:
-      "Не удалось отключить сон при закрытой крышке"
+      "Couldn't prevent sleep with the lid closed"
     case .restoreFailed, .stateVerificationFailed:
-      "Не удалось вернуть обычный режим сна"
+      "Couldn't restore normal sleep"
     case .watchdogFailed:
-      "Не удалось запустить защиту от аварийного завершения"
+      "Couldn't start crash recovery"
     }
   }
 }
@@ -140,7 +140,7 @@ protocol PowerProtectInstalling: AnyObject {
 @MainActor
 final class PowerProtectInstaller: PowerProtectInstalling {
   static let authorizationPrompt =
-    "Разрешите Mac работать с закрытой крышкой. Подтверждение потребуется один раз."
+    "Allow Methamphetamine to keep your Mac running with the lid closed. You'll only need to confirm once."
 
   static var authorizationPreviewAppleScript: String {
     "do shell script \"/usr/bin/true\" with prompt \"\(authorizationPrompt)\" with administrator privileges"

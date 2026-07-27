@@ -22,7 +22,7 @@ struct MenuIssueView: View {
         if isResolving {
           ProgressView()
             .controlSize(.small)
-            .accessibilityLabel("Выполняется")
+            .accessibilityLabel("In progress")
         } else {
           Image(systemName: "chevron.right")
             .font(.caption)

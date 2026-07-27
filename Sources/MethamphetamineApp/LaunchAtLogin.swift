@@ -45,7 +45,7 @@ protocol LaunchAtLoginControlling: AnyObject {
 
 @MainActor
 final class LaunchAtLoginController: LaunchAtLoginControlling {
-  static let failureMessage = "Не удалось включить автозапуск"
+  static let failureMessage = "Couldn't enable launch at login"
 
   private let service: any LaunchAtLoginServicing
   private let canRegisterCurrentApp: () -> Bool

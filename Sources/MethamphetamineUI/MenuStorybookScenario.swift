@@ -8,8 +8,8 @@ struct MenuStorybookScenario: Identifiable {
   static let all: [MenuStorybookScenario] = [
     .init(
       id: "disabled",
-      title: "Выключено",
-      note: "Mac спит как обычно",
+      title: "Off",
+      note: "Mac sleeps normally",
       state: .init(
         isProtectionEnabled: false,
         isPreparingProtection: false,
@@ -19,8 +19,8 @@ struct MenuStorybookScenario: Identifiable {
     ),
     .init(
       id: "waiting",
-      title: "Ожидание",
-      note: "Защита включена, задач нет",
+      title: "Waiting",
+      note: "Protection is on, but no tasks are active",
       state: .init(
         isProtectionEnabled: true,
         isPreparingProtection: false,
@@ -30,8 +30,8 @@ struct MenuStorybookScenario: Identifiable {
     ),
     .init(
       id: "protected",
-      title: "Codex работает",
-      note: "Mac защищён от сна",
+      title: "Codex is working",
+      note: "Your Mac will stay awake",
       state: .init(
         isProtectionEnabled: true,
         isPreparingProtection: false,
@@ -41,8 +41,8 @@ struct MenuStorybookScenario: Identifiable {
     ),
     .init(
       id: "grace",
-      title: "Задача завершилась",
-      note: "Короткая пауза перед возвратом сна",
+      title: "Task completed",
+      note: "Short pause before allowing sleep",
       state: .init(
         isProtectionEnabled: true,
         isPreparingProtection: false,
@@ -52,8 +52,8 @@ struct MenuStorybookScenario: Identifiable {
     ),
     .init(
       id: "low-battery",
-      title: "Низкий заряд",
-      note: "При 10% и ниже Mac может уснуть",
+      title: "Low battery",
+      note: "Your Mac may sleep at 10% or below",
       state: .init(
         isProtectionEnabled: true,
         isPreparingProtection: false,
@@ -63,8 +63,8 @@ struct MenuStorybookScenario: Identifiable {
     ),
     .init(
       id: "preparing",
-      title: "Настройка",
-      note: "Ожидание системного подтверждения",
+      title: "Setup",
+      note: "Waiting for system confirmation",
       state: .init(
         isProtectionEnabled: false,
         isPreparingProtection: true,
@@ -74,8 +74,8 @@ struct MenuStorybookScenario: Identifiable {
     ),
     .init(
       id: "permission",
-      title: "Нужно разрешение",
-      note: "Чтобы Mac работал с закрытой крышкой",
+      title: "Permission required",
+      note: "To keep your Mac running with the lid closed",
       state: .init(
         isProtectionEnabled: false,
         isPreparingProtection: false,
@@ -85,8 +85,8 @@ struct MenuStorybookScenario: Identifiable {
     ),
     .init(
       id: "restore",
-      title: "Сон не включился",
-      note: "Mac не засыпает после завершения задачи",
+      title: "Sleep wasn't re-enabled",
+      note: "Mac stays awake after the task completes",
       state: .init(
         isProtectionEnabled: false,
         isPreparingProtection: false,
@@ -96,8 +96,8 @@ struct MenuStorybookScenario: Identifiable {
     ),
     .init(
       id: "restoring",
-      title: "Возврат сна",
-      note: "Приложение возвращает обычный режим сна",
+      title: "Restoring sleep",
+      note: "Restoring normal sleep settings",
       state: .init(
         isProtectionEnabled: false,
         isPreparingProtection: false,
