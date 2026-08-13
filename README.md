@@ -2,6 +2,12 @@
 
 Methamphetamine is a small macOS menu bar app that keeps your Mac awake while Codex is working. It detects active Codex tasks automatically, prevents sleep while they run, and allows your Mac to sleep again when they finish.
 
+## Download
+
+[Download the latest version for macOS](https://github.com/mishanaer/Methamphetamine/releases/latest/download/Methamphetamine.dmg)
+
+Open the DMG, then drag Methamphetamine to Applications. Requires macOS 13 or later.
+
 ## How it works
 
 - Keeps Codex running when your Mac would normally go to sleep
