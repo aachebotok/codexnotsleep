@@ -1,131 +1,29 @@
 # Methamphetamine
 
-Нативное macOS menu bar-приложение без Dock-иконки. Оно не даёт Mac уснуть и позволяет закрыть крышку, пока Codex выполняет задачу.
+Methamphetamine is a small macOS menu bar app that keeps your Mac awake while Codex is working. It detects active Codex tasks automatically, prevents sleep while they run, and allows your Mac to sleep again when they finish.
 
-## Продуктовый контракт
+## How it works
 
-Основной переключатель означает: **не давать Mac уснуть, пока Codex выполняет задачу**.
+- Keeps Codex running when your Mac would normally go to sleep
+- Can keep tasks running when the lid is closed
+- Turns sleep protection off when the last task finishes
+- Restores protection if the task starts working again
+- Allows sleep at 10% battery or below
+- Runs locally with no account or API connection
 
-- открытый, но бездействующий Codex не включает защиту;
-- `task_started` включает защиту, а `task_complete`, `turn_complete` или `turn_aborted` снимают её;
-- после завершения последней задачи защита снимается через 15 секунд: это не даёт Mac уснуть в коротком промежутке между прерыванием и заменяющей задачей;
-- ручное выключение переключателя снимает защиту сразу;
-- Claude Code, Cursor и остальные найденные агенты пока не управляют защитой: для них нет подключённого точного сигнала активной задачи;
-- состояние переключателя сохраняется между запусками.
+Methamphetamine requires macOS 13 or later. Keeping a Mac awake with the lid closed can use more battery and generate heat, so do not leave it running inside a bag.
 
-Когда Mac работает от батареи и заряд опускается до 10% или ниже, приложение автоматически снимает защиту от сна. При заряде выше 10% или после подключения питания защита возобновляется, если агент всё ещё запущен. Отдельной настройки для этого правила нет. Если состояние батареи прочитать не удалось, основной режим продолжает работать.
+## Privacy and permissions
 
-Список найденных агентов в меню не показывается. Никакого подключения к аккаунту или API Codex нет.
+Methamphetamine reads lifecycle markers from local Codex session files to know when a task starts and finishes. It does not store or send your prompts, responses, or code.
 
-## Поддерживаемые агенты
-
-| Агент | macOS-приложение | CLI |
-| --- | --- | --- |
-| [Codex](https://github.com/openai/codex) | `com.openai.codex` | `codex` |
-| [Claude Code](https://code.claude.com/docs/en/quickstart) | `com.anthropic.claudefordesktop` | `claude` |
-| [Cursor](https://docs.cursor.com/en/cli/installation) | `com.todesktop.230313mzl4w4u92` | `cursor-agent` |
-| [Devin](https://docs.devin.ai/) (бывший Windsurf) | `com.exafunction.windsurf` | `devin` |
-| [Zed Agent](https://zed.dev/docs/ai/overview) | `dev.zed.Zed` | — |
-| [OpenCode](https://opencode.ai/docs/cli/) | `ai.opencode.desktop` (+ Beta/Dev) | `opencode` |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | — | `gemini` |
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli) | — | `copilot`† |
-| [Aider](https://aider.chat/docs/install.html) | — | `aider` |
-| [Kimi Code](https://www.kimi.com/code/docs/en/) | — | `kimi` |
-| [Qwen Code](https://github.com/QwenLM/qwen-code) | `com.alibaba.qwen-code` | `qwen` |
-| [Grok Build](https://docs.x.ai/build/cli/reference) | — | `grok`† |
-| [Kiro](https://kiro.dev/docs/cli/installation/) | `dev.kiro.desktop` | `kiro-cli` |
-| [Google Antigravity](https://antigravity.google/docs/cli/getting-started) | `com.google.antigravity`, `com.google.antigravity-ide` | `agy` |
-| [Amp](https://ampcode.com/manual) | — | `amp`† |
-| [Auggie](https://docs.augmentcode.com/cli/overview) | — | `auggie` |
-| [Cline CLI](https://docs.cline.bot/cli/cli-reference) | — | `cline` |
-| [Continue CLI](https://docs.continue.dev/cli/quickstart) | — | `cn`† |
-| [Factory Droid](https://docs.factory.ai/cli/getting-started/quickstart) | — | `droid`† |
-| [Goose](https://github.com/block/goose) | `com.block.goose`, `com.electron.goose` | `goose`† |
-| [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | — | `vibe`, `vibe-acp`† |
-| [Junie CLI](https://junie.jetbrains.com/docs/junie-cli.html) | — | `junie` |
-| [Kilo Code](https://kilo.ai/docs/code-with-ai/platforms/cli) | — | `kilo`† |
-| [Crush](https://github.com/charmbracelet/crush) | — | `crush`† |
-| [OpenHands CLI](https://docs.openhands.dev/openhands/usage/cli/installation) | — | `openhands` |
-| [CodeBuddy Code](https://www.codebuddy.cn/docs/cli/installation) | — | `codebuddy` |
-| [Codebuff](https://www.codebuff.com/docs/help/quick-start) | — | `codebuff` |
-| [Tabnine CLI](https://docs.tabnine.com/main/getting-started/tabnine-cli) | — | `tabnine` |
-| [Neovate Code](https://github.com/neovateai/neovate-code) | — | `neovate` |
-| [Pochi](https://docs.getpochi.com/cli/) | — | `pochi` |
-| [Qoder CLI](https://docs.qoder.com/en/cli/quick-start) | — | `qodercli` |
-| [Trae Agent](https://github.com/bytedance/trae-agent) | `com.trae.app` | `trae-cli` |
-| [Pi Coding Agent](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) | — | `pi`† |
-| [Warp Oz](https://docs.warp.dev/reference/cli) | — | `oz`, `oz-preview`† |
-
-† У команды неоднозначное имя, поэтому совпадения по одному basename недостаточно: дополнительно проверяется реальный путь установки, подпись разработчика или служебный каталог продукта.
-
-В основной список намеренно не входят модели без собственного локального клиента, браузерные агенты, IDE-плагины без отдельного процесса, закрытые и устаревающие продукты вроде Roo Code, iFlow CLI или Qodo Gen CLI, а также инфраструктурные конструкторы агентов вроде Docker Agent. Их нельзя честно связать с локально выполняющейся задачей тем способом, который использует приложение.
-
-Произвольный неизвестный агент автоматически распознать нельзя: для него нужно добавить стабильные сигнатуры в `CodingAgentCatalog`.
-
-## Как работает обнаружение агентов
-
-- приложения находятся по bundle ID через `NSWorkspace`; URL из Launch Services дополнительно проверяется на диске;
-- CLI ищутся по точному имени в официальных каталогах самих агентов и в глобальных каталогах Homebrew, local, Cargo, Bun, Volta, pnpm, nvm, asdf и mise;
-- для коротких или общеупотребительных CLI-имён проверяется канонический target symlink, подпись разработчика либо наличие служебного каталога конкретного агента;
-- процессы CLI учитываются только для текущего пользователя и только с controlling TTY;
-- native-бинарники и Node/Python-launcher сопоставляются с реальным путём найденной установки, а не только по имени процесса;
-- внутренние `*.app/Contents/Resources`, проектные `node_modules/.bin` и `codex app-server` не считаются отдельными агентами;
-- бинарники не запускаются с `--version`. Из списка процессов разбираются только путь запуска и первые аргументы, нужные для распознавания launcher/helper; они не сохраняются.
-
-Установка через нестандартный каталог или запуск вида `python -m aider` могут не обнаружиться в текущей версии.
-
-Этот каталог нужен для локального обнаружения установленных продуктов и будущих точных интеграций. В текущей версии процессные признаки других агентов намеренно не включают защиту: открытое приложение не доказывает, что агент делает задачу.
-
-## Как определяется активная задача Codex
-
-- без разрешений и hooks через `libproc` находятся живые процессы `codex`;
-- приложение отслеживает как открытые ими rollout-файлы, так и все сессии в `~/.codex/sessions`, изменённые после запуска текущего процесса Codex — поэтому фоновые задачи в других окнах тоже удерживают защиту;
-- для каждого корневого пользовательского rollout читается последнее lifecycle-событие; скопированная история сабагентов не учитывается;
-- при запуске приложение читает файл с конца до ближайшего lifecycle-события, затем — только новые дописанные байты;
-- когда основной переключатель выключен, rollout-файлы не опрашиваются;
-- после обработки в состоянии остаются только тип события, ID задачи и время старта. Промпты, ответы и код не логируются, не записываются приложением и никуда не передаются;
-- `started_at` сверяется со временем запуска текущего процесса Codex, поэтому незавершённая запись от упавшего старого процесса не включает защиту после перезапуска;
-- активная задача без новых записей в rollout-файле в течение часа считается зависшей; защита снимается и автоматически вернётся, если файл снова начнёт расти;
-- нечитаемый файл или сессия без поддерживаемых lifecycle-событий удерживают защиту не более 15 минут без новых данных;
-- запущенный Codex без найденных сессий удерживает защиту не более 15 минут, если список процессов прочитан надёжно; при ошибке чтения процессов приложение остаётся в безопасном режиме;
-- эти пограничные состояния обрабатываются в фоне и не добавляют предупреждений в меню.
-
-Ограничение: если одна команда Codex действительно работает больше часа и всё это время ничего не записывает в rollout-файл, приложение примет её за зависшую и разрешит сон. Часовой порог выбран с запасом для локальных команд, которые могут молчать 40–50 минут.
-
-Rollout-файл технически содержит полный локальный транскрипт, поэтому при поиске событий приложение читает его байты. Парсер проверяет только короткие структурные маркеры lifecycle и не создаёт модель содержимого. Формат JSONL внутренний и может измениться; совместимость защищена консервативным fallback, но не является публичным контрактом Codex.
-
-## Разрешения и сон
-
-Для обычного автоматического сна приложение использует публичный IOPM idle-sleep assertion. Чтобы агенты продолжали работать и после закрытия крышки, оно также переключает системный режим Power Protect теми же двумя командами, что использует Amphetamine:
+Keeping a Mac awake with the lid closed requires a one-time administrator confirmation. This installs a narrow `sudoers` rule that allows only the two required `pmset` commands. To remove the rule:
 
 ```bash
-sudo pmset -a disablesleep 1
-sudo pmset -a disablesleep 0
+sudo rm /private/etc/sudoers.d/methamphetamine_power_protect_$(id -u)
 ```
 
-При первом включении macOS один раз попросит Touch ID или пароль администратора. Установленное правило разрешает текущему macOS-пользователю без повторных запросов выполнять только эти две точные команды. Оно не даёт приложению произвольный root-доступ.
-
-Приложению по-прежнему не нужны:
-
-- Automation или Apple Events;
-- Accessibility;
-- Full Disk Access;
-- Amphetamine;
-- hooks Codex или Claude.
-
-Methamphetamine запоминает, меняло ли оно системный режим само. Если `SleepDisabled` уже был включён другой программой, приложение не выключает его за неё. Если режим включила Methamphetamine, она возвращает обычный сон через 15 секунд после завершения последней задачи Codex, сразу при выключении переключателя и при штатном завершении приложения. Локальный watchdog также пытается вернуть сон после аварийного завершения, а незакрытая сессия восстанавливается при следующем запуске.
-
-Закрытие крышки всё равно может заблокировать экран — критерий успеха в том, что процессы агентов продолжают работать. Состояние батареи читается через публичный IOKit API и не требует отдельного разрешения. Поведение недокументированного `disablesleep` при ручной команде Sleep, критическом заряде, перегреве, системном сбое и жёсткой перезагрузке не гарантируется. Закрытый Mac может быстрее разряжаться и сильнее нагреваться; не кладите его работающим в сумку.
-
-`pmset disablesleep` — глобальная системная настройка без владельца и reference counting. Одновременное использование Amphetamine, ручного `pmset` и Methamphetamine может привести к конфликту. В этой локальной сборке применяется отдельное для текущего UID узкое правило `sudoers`, подходящее для прототипа; удаление приложения само это правило не удаляет. Для публичного распространения его нужно заменить подписанным и нотарифицированным привилегированным helper с lease/heartbeat через `SMAppService`.
-
-## Миграция со старой версии
-
-При обновлении прежний выбор агентов переносится в общий переключатель: если был включён хотя бы один агент, защита остаётся включённой. Версия 0.2 также один раз читает прежние hook-настройки и удаляет только команды старого `Contents/Helpers/meth-hook` с маркером `methamphetamine-hook`. Перед изменением рядом с реальным JSON-файлом создаётся timestamped backup. Остальные настройки и hooks сохраняются.
-
-## Сборка
-
-Требуются macOS 13+ и Swift 6 toolchain.
+## Build
 
 ```bash
 swift test
@@ -133,8 +31,4 @@ swift build -c release
 ./scripts/package.sh
 ```
 
-Готовый bundle для архитектуры текущего Mac создаётся в `dist/Methamphetamine.app`. Локальный скрипт использует ad-hoc подпись. Для распространения клиентам нужны Universal 2 либо отдельные сборки, Developer ID подпись и notarization.
-
-## Проверка
-
-Тесты покрывают каталог сигнатур, start/complete/abort, несколько параллельных задач, скопированную историю сабагентов, частичную строку, замену файла, перезапуск процесса, часовой таймаут зависшей задачи, 15-минутные таймауты сбойных и пустых сессий, возобновление после роста файла, безопасный fallback, переключатель, порог заряда и питание от сети, Power Protect без реального `sudo` и read-only smoke scan текущей задачи Codex.
+The packaging script creates a local ad-hoc signed app in `dist/`. Public releases must be signed with Developer ID and notarized by Apple.
