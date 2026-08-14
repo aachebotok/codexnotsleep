@@ -131,9 +131,8 @@ final class AppController: NSObject, ObservableObject {
     }
   }
 
-  var menuIcon: String {
-    if menuIssue != nil { return "exclamationmark.circle.fill" }
-    return "pill.fill"
+  var showsMenuIssue: Bool {
+    menuIssue != nil
   }
 
   func start() {
