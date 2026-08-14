@@ -28,7 +28,7 @@ struct MethamphetamineApplication: App {
     MenuBarExtra {
       MenuContentView(controller: controller)
     } label: {
-      Image(systemName: controller.menuIcon)
+      MenuBarCapsuleIcon(showsIssue: controller.showsMenuIssue)
         .accessibilityLabel("Methamphetamine: \(controller.statusTitle)")
     }
     .menuBarExtraStyle(.window)

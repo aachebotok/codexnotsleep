@@ -38,7 +38,7 @@ struct AppControllerProtectionTests {
       DetectedCodingAgent(definition: definition, isInstalled: true, isRunning: true)
     ]
 
-    #expect(controller.menuIcon == "pill.fill")
+    #expect(!controller.showsMenuIssue)
     #expect(!backend.isHeld)
 
     controller.setProtectionEnabled(true)
@@ -373,7 +373,7 @@ struct AppControllerProtectionTests {
     controller.refreshCodexActivity()
     #expect(backend.isHeld)
     #expect(controller.visibleError == nil)
-    #expect(controller.menuIcon == "pill.fill")
+    #expect(!controller.showsMenuIssue)
     #expect(controller.statusTitle == "Preventing sleep")
 
     controller.setProtectionEnabled(false)

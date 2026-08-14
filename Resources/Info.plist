@@ -9,7 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>app.methamphetamine.Methamphetamine</string>
     <key>CFBundleIconFile</key>
-    <string>AppIcon.icns</string>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -21,7 +23,7 @@
     <key>CFBundleShortVersionString</key>
     <string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>33</string>
+	<string>40</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSMultipleInstancesProhibited</key>

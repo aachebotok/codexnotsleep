@@ -8,6 +8,8 @@ Methamphetamine is a small macOS menu bar app that keeps your Mac awake while Co
 
 Open the DMG, then drag Methamphetamine to Applications. Requires macOS 13 or later.
 
+Current release: 0.2.0 (build 40). SHA-256: `44cb2e92865d4866c405e057f74b6cd973d6d8465f4f9f5d337e6212cd500517`.
+
 ## How it works
 
 - Keeps Codex running when your Mac would normally go to sleep

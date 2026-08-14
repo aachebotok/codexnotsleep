@@ -3,3 +3,6 @@
 .swiftpm/
 dist/
 .DS_Store
+IconAssets/AppIcon/compiled/
+IconAssets/AppIcon/final-preview/
+IconAssets/AppIcon/previews/

@@ -1,0 +1,26 @@
+{
+  "name": "AppIcon",
+  "platforms": ["macos"],
+  "background": {
+    "default": "#4A4A4A",
+    "dark": "#343434"
+  },
+  "layers": [
+    {
+      "name": "Upper Capsule",
+      "default": "layers/upper.svg",
+      "dark": "layers/upper.svg",
+      "tinted": "layers/upper.svg",
+      "glass": false,
+      "shadowOpacity": 0.2
+    },
+    {
+      "name": "Lower Capsule",
+      "default": "layers/lower.svg",
+      "dark": "layers/lower.svg",
+      "tinted": "layers/lower.svg",
+      "glass": false,
+      "shadowOpacity": 0.16
+    }
+  ]
+}
