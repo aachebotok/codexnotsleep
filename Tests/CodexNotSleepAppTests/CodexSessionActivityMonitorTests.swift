@@ -308,6 +308,30 @@ struct CodexSessionActivityMonitorTests {
   }
 
   @Test
+  func newRuntimeWithoutSessionUsesStartupFallbackAfterPreviousRuntimeExited() throws {
+    let fixture = try SessionFixture()
+    let file = try fixture.makeRootSession(events: [start("A")])
+    let locator = FakeCodexOpenSessionLocator(files: [owned(file)])
+    let monitor = CodexSessionActivityMonitor(locator: locator)
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+
+    locator.inventory = CodexOpenSessionInventory(
+      hasCodexRuntime: false,
+      files: [],
+      isReliable: true
+    )
+    #expect(monitor.refresh() == .idle)
+
+    locator.inventory = CodexOpenSessionInventory(
+      hasCodexRuntime: true,
+      files: [],
+      isReliable: true
+    )
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+  }
+
+  @Test
   func findingASessionMakesLaterEmptyRuntimeIdle() throws {
     let fixture = try SessionFixture()
     let file = try fixture.makeRootSession(events: [start("A")])

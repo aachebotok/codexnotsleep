@@ -44,8 +44,10 @@ final class AppController: NSObject, ObservableObject {
   }
 
   convenience init(startsAutomatically: Bool) {
+    let defaults = UserDefaults.standard
+    LegacyPreferencesMigrator(defaults: defaults).migrate()
     self.init(
-      defaults: .standard,
+      defaults: defaults,
       detector: CodingAgentSystemScanner(),
       legacyIntegrations: LegacyIntegrationMigrator(),
       backend: CombinedSleepProtectionBackend(
@@ -144,6 +146,10 @@ final class AppController: NSObject, ObservableObject {
   func start() {
     guard !started else { return }
     started = true
+
+    if let launchAtLoginError = launchAtLoginController.enableByDefault() {
+      NSLog("Codex Not Sleep launch-at-login setup failed: %@", launchAtLoginError)
+    }
 
     NotificationCenter.default.addObserver(
       self,

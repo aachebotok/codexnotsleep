@@ -104,7 +104,7 @@ struct LaunchAtLoginControllerTests {
   }
 
   @Test
-  func appStartDoesNotEnableLaunchAtLogin() throws {
+  func appStartEnablesLaunchAtLoginOnce() throws {
     let suiteName = "CodexNotSleep.LaunchAtLoginTests.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -125,7 +125,7 @@ struct LaunchAtLoginControllerTests {
     controller.start()
     controller.start()
 
-    #expect(launchAtLogin.enableCount == 0)
+    #expect(launchAtLogin.enableCount == 1)
   }
 }
 
