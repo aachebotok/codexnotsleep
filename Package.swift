@@ -2,20 +2,20 @@
 import PackageDescription
 
 let package = Package(
-  name: "Methamphetamine",
+  name: "CodexNotSleep",
   platforms: [.macOS(.v13)],
   products: [
-    .library(name: "MethamphetamineCore", targets: ["MethamphetamineCore"]),
-    .library(name: "MethamphetamineUI", targets: ["MethamphetamineUI"]),
-    .executable(name: "Methamphetamine", targets: ["MethamphetamineApp"]),
-    .executable(name: "MethamphetamineStorybook", targets: ["MethamphetamineStorybook"]),
+    .library(name: "CodexNotSleepCore", targets: ["CodexNotSleepCore"]),
+    .library(name: "CodexNotSleepUI", targets: ["CodexNotSleepUI"]),
+    .executable(name: "CodexNotSleep", targets: ["CodexNotSleepApp"]),
+    .executable(name: "CodexNotSleepStorybook", targets: ["CodexNotSleepStorybook"]),
   ],
   targets: [
-    .target(name: "MethamphetamineCore"),
-    .target(name: "MethamphetamineUI"),
+    .target(name: "CodexNotSleepCore"),
+    .target(name: "CodexNotSleepUI"),
     .executableTarget(
-      name: "MethamphetamineApp",
-      dependencies: ["MethamphetamineCore", "MethamphetamineUI"],
+      name: "CodexNotSleepApp",
+      dependencies: ["CodexNotSleepCore", "CodexNotSleepUI"],
       linkerSettings: [
         .linkedFramework("AppKit"),
         .linkedFramework("IOKit"),
@@ -24,14 +24,14 @@ let package = Package(
       ]
     ),
     .executableTarget(
-      name: "MethamphetamineStorybook",
-      dependencies: ["MethamphetamineUI"],
+      name: "CodexNotSleepStorybook",
+      dependencies: ["CodexNotSleepUI"],
       linkerSettings: [.linkedFramework("AppKit")]
     ),
-    .testTarget(name: "MethamphetamineCoreTests", dependencies: ["MethamphetamineCore"]),
+    .testTarget(name: "CodexNotSleepCoreTests", dependencies: ["CodexNotSleepCore"]),
     .testTarget(
-      name: "MethamphetamineAppTests",
-      dependencies: ["MethamphetamineApp", "MethamphetamineCore", "MethamphetamineUI"]),
+      name: "CodexNotSleepAppTests",
+      dependencies: ["CodexNotSleepApp", "CodexNotSleepCore", "CodexNotSleepUI"]),
   ],
   swiftLanguageModes: [.v6]
 )
