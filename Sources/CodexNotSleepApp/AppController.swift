@@ -145,6 +145,10 @@ final class AppController: NSObject, ObservableObject {
     guard !started else { return }
     started = true
 
+    if let launchAtLoginError = launchAtLoginController.enableByDefault() {
+      NSLog("Codex Not Sleep launch-at-login setup failed: %@", launchAtLoginError)
+    }
+
     NotificationCenter.default.addObserver(
       self,
       selector: #selector(applicationWillTerminate),
