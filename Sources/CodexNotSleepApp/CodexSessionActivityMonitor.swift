@@ -774,6 +774,7 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       states.removeAll()
       failureLiveness.removeAll()
       emptyInventorySince = nil
+      hasObservedSession = false
       snapshot = .idle
       return snapshot
     }

@@ -49,4 +49,57 @@ struct AgentProtectionStoreTests {
 
     #expect(!store.load())
   }
+
+  @Test
+  func migratesPreferencesFromPreviousBundleIdentifierOnce() throws {
+    let currentSuiteName = "CodexNotSleep.AgentProtectionStoreTests.current.\(UUID().uuidString)"
+    let legacySuiteName = "CodexNotSleep.AgentProtectionStoreTests.legacy.\(UUID().uuidString)"
+    let currentDefaults = try #require(UserDefaults(suiteName: currentSuiteName))
+    let legacyDefaults = try #require(UserDefaults(suiteName: legacySuiteName))
+    defer {
+      currentDefaults.removePersistentDomain(forName: currentSuiteName)
+      legacyDefaults.removePersistentDomain(forName: legacySuiteName)
+    }
+
+    legacyDefaults.set(true, forKey: AgentProtectionStore.key)
+    legacyDefaults.set(true, forKey: AgentProtectionStore.pendingPowerProtectKey)
+    legacyDefaults.set(["codex"], forKey: AgentProtectionStore.legacySelectionKey)
+
+    let migrator = LegacyPreferencesMigrator(
+      defaults: currentDefaults,
+      legacyDefaults: legacyDefaults
+    )
+    migrator.migrate()
+
+    #expect(currentDefaults.bool(forKey: AgentProtectionStore.key))
+    #expect(currentDefaults.bool(forKey: AgentProtectionStore.pendingPowerProtectKey))
+    #expect(currentDefaults.stringArray(forKey: AgentProtectionStore.legacySelectionKey) == ["codex"])
+
+    legacyDefaults.set(false, forKey: AgentProtectionStore.key)
+    migrator.migrate()
+    #expect(currentDefaults.bool(forKey: AgentProtectionStore.key))
+  }
+
+  @Test
+  func migrationDoesNotOverwriteCurrentPreferences() throws {
+    let currentSuiteName = "CodexNotSleep.AgentProtectionStoreTests.current.\(UUID().uuidString)"
+    let legacySuiteName = "CodexNotSleep.AgentProtectionStoreTests.legacy.\(UUID().uuidString)"
+    let currentDefaults = try #require(UserDefaults(suiteName: currentSuiteName))
+    let legacyDefaults = try #require(UserDefaults(suiteName: legacySuiteName))
+    defer {
+      currentDefaults.removePersistentDomain(forName: currentSuiteName)
+      legacyDefaults.removePersistentDomain(forName: legacySuiteName)
+    }
+
+    currentDefaults.set(false, forKey: AgentProtectionStore.key)
+    legacyDefaults.set(true, forKey: AgentProtectionStore.key)
+
+    LegacyPreferencesMigrator(
+      defaults: currentDefaults,
+      legacyDefaults: legacyDefaults
+    ).migrate()
+
+    #expect(currentDefaults.object(forKey: AgentProtectionStore.key) != nil)
+    #expect(!currentDefaults.bool(forKey: AgentProtectionStore.key))
+  }
 }

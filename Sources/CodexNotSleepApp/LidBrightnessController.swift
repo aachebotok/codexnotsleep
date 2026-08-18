@@ -154,7 +154,6 @@ enum LidBrightnessCurve {
   static let closedAngle = 1.0
   static let restorationAngle = 60.0
   static let sensorMaximumAngle = 180.0
-  static let defaultTransitionDuration: TimeInterval = 0.75
 
   static func openFraction(
     for angle: Double,
@@ -179,10 +178,6 @@ enum LidBrightnessCurve {
         * openFraction(for: angle, openAngle: openAngle)
   }
 
-  static func smoothProgress(_ progress: Double) -> Double {
-    let progress = min(max(progress, 0), 1)
-    return progress * progress * (3 - 2 * progress)
-  }
 }
 
 struct ManagedDisplayBrightness: Equatable {
@@ -262,6 +257,16 @@ final class SystemDisplayBrightnessProvider: DisplayBrightnessProviding {
   }
 
   private func builtInDisplayID() -> UInt32? {
+    var count: UInt32 = 0
+    if CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 {
+      var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+      if CGGetOnlineDisplayList(count, &displays, &count) == .success,
+         let builtIn = displays.prefix(Int(count)).first(where: { CGDisplayIsBuiltin($0) == 1 })
+      {
+        return UInt32(builtIn)
+      }
+    }
+
     for screen in NSScreen.screens {
       guard
         let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
@@ -339,50 +344,42 @@ final class NoOpLidBrightnessController: LidBrightnessControlling {
 final class LidBrightnessController: LidBrightnessControlling {
   private struct DisplayState {
     let original: Double
-    let referenceOpenAngle: Double
     var current: Double
-    var target: Double
-    var transitionFrom: Double
-    var transitionStartedAt: Date?
   }
 
-  private static let frameInterval: TimeInterval = 1.0 / 30.0
-  private static let sensorInterval: TimeInterval = 1.0 / 10.0
-  private static let transitionDuration = LidBrightnessCurve.defaultTransitionDuration
+  private static let sensorInterval: TimeInterval = 1.0 / 30.0
 
   private let angleSensor: any LidAngleProviding
   private let displayProvider: any DisplayBrightnessProviding
+  private let schedulesTimer: Bool
   private var displayStates: [UInt32: DisplayState] = [:]
   private var timer: Timer?
   private var isCodexWorking = false
-  private var lastSensorReadAt = Date.distantPast
-  private var currentAngle: Double?
 
   init(
-    angleSensor: any LidAngleProviding = IOKitLidAngleSensor(),
-    displayProvider: any DisplayBrightnessProviding = SystemDisplayBrightnessProvider()
+    angleSensor: any LidAngleProviding,
+    displayProvider: any DisplayBrightnessProviding,
+    schedulesTimer: Bool = true
   ) {
     self.angleSensor = angleSensor
     self.displayProvider = displayProvider
+    self.schedulesTimer = schedulesTimer
+  }
+
+  convenience init() {
+    self.init(
+      angleSensor: IOKitLidAngleSensor(),
+      displayProvider: SystemDisplayBrightnessProvider()
+    )
   }
 
   func setCodexWorking(_ isWorking: Bool) {
     if isWorking {
-      guard !isCodexWorking else { return }
-      isCodexWorking = true
-      if displayStates.isEmpty {
-        beginManagingBrightness()
-      } else {
-        lastSensorReadAt = Date.now
-        if let angle = angleSensor.currentAngle() {
-          currentAngle = angle
-          updateTargets(for: angle, at: Date.now)
-          ensureTimer()
-        } else {
-          isCodexWorking = false
-          restoreBrightness()
-        }
+      if !isCodexWorking {
+        isCodexWorking = true
+        refreshBrightness()
       }
+      ensureTimer()
       return
     }
 
@@ -393,151 +390,59 @@ final class LidBrightnessController: LidBrightnessControlling {
 
   func reset() {
     isCodexWorking = false
-    for (id, state) in displayStates {
-      _ = displayProvider.setBrightness(state.original, for: id)
-    }
-    displayStates.removeAll()
-    timer?.invalidate()
-    timer = nil
+    restoreBrightness(stopping: true)
   }
 
-  private func beginManagingBrightness() {
-    guard let angle = angleSensor.currentAngle(),
-          let display = displayProvider.currentBuiltInDisplay()
-    else {
-      isCodexWorking = false
+  func refreshBrightness() {
+    guard isCodexWorking else { return }
+    guard let angle = angleSensor.currentAngle() else { return }
+
+    if angle >= LidBrightnessCurve.restorationAngle {
+      restoreBrightness(stopping: false)
       return
     }
 
-    currentAngle = angle
-    lastSensorReadAt = Date.now
-    let referenceOpenAngle = referenceOpenAngle(for: angle)
-    let target = LidBrightnessCurve.targetBrightness(
-      original: display.brightness,
-      angle: angle,
-      openAngle: referenceOpenAngle
-    )
-    displayStates[display.id] = DisplayState(
-      original: display.brightness,
-      referenceOpenAngle: referenceOpenAngle,
-      current: display.brightness,
-      target: target,
-      transitionFrom: display.brightness,
-      transitionStartedAt: target == display.brightness ? nil : Date.now
-    )
-    ensureTimer()
-  }
-
-  private func restoreBrightness() {
-    let now = Date.now
-    for id in displayStates.keys {
-      guard var state = displayStates[id] else { continue }
-      guard abs(state.target - state.original) > 0.0001 || state.transitionStartedAt != nil
-      else { continue }
-      state.transitionFrom = state.current
-      state.target = state.original
-      state.transitionStartedAt = now
-      displayStates[id] = state
+    if displayStates.isEmpty, let display = displayProvider.currentBuiltInDisplay() {
+      displayStates[display.id] = DisplayState(
+        original: display.brightness,
+        current: display.brightness
+      )
     }
 
-    if displayStates.isEmpty {
+    applyBrightness(for: angle)
+  }
+
+  private func restoreBrightness(stopping: Bool = true) {
+    for (id, state) in displayStates where abs(state.current - state.original) > 0.0005 {
+      _ = displayProvider.setBrightness(state.original, for: id)
+    }
+    displayStates.removeAll()
+    if stopping {
       timer?.invalidate()
       timer = nil
-    } else {
-      ensureTimer()
     }
   }
 
   private func ensureTimer() {
-    guard timer == nil else { return }
-    let timer = Timer(timeInterval: Self.frameInterval, repeats: true) { [weak self] _ in
+    guard schedulesTimer, timer == nil else { return }
+    let timer = Timer(timeInterval: Self.sensorInterval, repeats: true) { [weak self] _ in
       Task { @MainActor in
-        self?.tick()
+        self?.refreshBrightness()
       }
     }
-    timer.tolerance = 0.01
+    timer.tolerance = 0.005
     RunLoop.main.add(timer, forMode: .common)
     self.timer = timer
   }
 
-  private func tick() {
-    let now = Date.now
-    if isCodexWorking, now.timeIntervalSince(lastSensorReadAt) >= Self.sensorInterval {
-      lastSensorReadAt = now
-      if let angle = angleSensor.currentAngle() {
-        currentAngle = angle
-        updateTargets(for: angle, at: now)
-      } else {
-        // A lost sensor must never leave a dimmed screen behind.
-        currentAngle = nil
-        isCodexWorking = false
-        restoreBrightness()
-      }
-    }
-
-    var finishedIDs: [UInt32] = []
-    for (id, var state) in displayStates {
-      guard let transitionStartedAt = state.transitionStartedAt else {
-        if !isCodexWorking, abs(state.current - state.original) <= 0.0001 {
-          finishedIDs.append(id)
-        }
-        continue
-      }
-      let elapsed = now.timeIntervalSince(transitionStartedAt)
-      let progress = min(max(elapsed / Self.transitionDuration, 0), 1)
-      let easedProgress = LidBrightnessCurve.smoothProgress(progress)
-      let value = state.transitionFrom
-        + (state.target - state.transitionFrom) * easedProgress
-      _ = displayProvider.setBrightness(value, for: id)
-      state.current = value
-      if progress >= 1 {
-        state.current = state.target
-        state.transitionStartedAt = nil
-      }
-      displayStates[id] = state
-
-      if !isCodexWorking,
-         state.transitionStartedAt == nil,
-         abs(state.current - state.original) <= 0.0001
-      {
-        finishedIDs.append(id)
-      }
-    }
-
-    for id in finishedIDs {
-      displayStates.removeValue(forKey: id)
-    }
-    if !isCodexWorking, displayStates.isEmpty {
-      timer?.invalidate()
-      timer = nil
-    }
-  }
-
-  private func updateTargets(for angle: Double, at date: Date) {
+  private func applyBrightness(for angle: Double) {
     for id in displayStates.keys {
       guard var state = displayStates[id] else { continue }
-      let target = LidBrightnessCurve.targetBrightness(
-        original: state.original,
-        angle: angle,
-        openAngle: state.referenceOpenAngle
-      )
-      guard abs(target - state.target) > 0.0005 else { continue }
-      state.transitionFrom = state.current
-      state.target = target
-      state.transitionStartedAt = date
+      let target = LidBrightnessCurve.targetBrightness(original: state.original, angle: angle)
+      guard abs(target - state.current) > 0.0005 else { continue }
+      guard displayProvider.setBrightness(target, for: id) else { continue }
+      state.current = target
       displayStates[id] = state
     }
-  }
-
-  private func referenceOpenAngle(for angle: Double) -> Double {
-    let angle = min(
-      max(angle, LidBrightnessCurve.closedAngle),
-      LidBrightnessCurve.sensorMaximumAngle
-    )
-    // Brightness is fully restored once the lid reaches 60 degrees. If work
-    // starts below that point, preserve the current angle as the endpoint.
-    return angle <= LidBrightnessCurve.closedAngle
-      ? LidBrightnessCurve.restorationAngle
-      : min(angle, LidBrightnessCurve.restorationAngle)
   }
 }

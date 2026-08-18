@@ -4,11 +4,12 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-swift build -c release --disable-sandbox
-BIN_DIR="$(swift build -c release --disable-sandbox --show-bin-path)"
-APP_DIR="$PROJECT_DIR/dist/Codex Not Sleep.app"
+BUILD_ARGS=(-c release --disable-sandbox --arch arm64 --arch x86_64)
+swift build "${BUILD_ARGS[@]}"
+BIN_DIR="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)"
 STAGING_DIR="$(mktemp -d "/private/tmp/codexnotsleep-package.XXXXXX")"
-STAGING_APP="$STAGING_DIR/Codex Not Sleep.app"
+DMG_ROOT="$STAGING_DIR/dmg"
+STAGING_APP="$DMG_ROOT/Codex Not Sleep.app"
 
 cleanup() {
   rm -rf "$STAGING_DIR"
@@ -25,25 +26,38 @@ xattr -cr "$STAGING_APP"
 codesign --force --sign - "$STAGING_APP"
 codesign --verify --deep --strict "$STAGING_APP"
 
-rm -rf "$APP_DIR"
-mv "$STAGING_APP" "$APP_DIR"
-codesign --verify --deep --strict "$APP_DIR"
+test -x "$STAGING_APP/Contents/MacOS/CodexNotSleep"
+lipo "$STAGING_APP/Contents/MacOS/CodexNotSleep" -verify_arch arm64 x86_64
+test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$STAGING_APP/Contents/Info.plist")" = "true"
+test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$STAGING_APP/Contents/Info.plist")" = "AppIcon.icns"
+test -f "$STAGING_APP/Contents/Resources/AppIcon.icns"
+test ! -e "$STAGING_APP/Contents/Helpers"
+test ! -e "$STAGING_APP/Contents/Resources/meth-privileged-helper-scaffold"
 
-test -x "$APP_DIR/Contents/MacOS/CodexNotSleep"
-test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP_DIR/Contents/Info.plist")" = "true"
-test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$APP_DIR/Contents/Info.plist")" = "AppIcon.icns"
-test -f "$APP_DIR/Contents/Resources/AppIcon.icns"
-test ! -e "$APP_DIR/Contents/Helpers"
-test ! -e "$APP_DIR/Contents/Resources/meth-privileged-helper-scaffold"
-
-if grep -a -q 'tell application "Amphetamine"' "$APP_DIR/Contents/MacOS/CodexNotSleep"; then
+if grep -a -q 'tell application "Amphetamine"' "$STAGING_APP/Contents/MacOS/CodexNotSleep"; then
   echo "Unexpected legacy Amphetamine code in packaged binary" >&2
   exit 1
 fi
 
-if /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$APP_DIR/Contents/Info.plist" >/dev/null 2>&1; then
+if /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$STAGING_APP/Contents/Info.plist" >/dev/null 2>&1; then
   echo "Unexpected Apple Events permission description in packaged Info.plist" >&2
   exit 1
 fi
 
-echo "$APP_DIR"
+ln -s /Applications "$DMG_ROOT/Applications"
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$STAGING_APP/Contents/Info.plist")"
+DMG_NAME="Codex-Not-Sleep-$VERSION.dmg"
+STAGING_DMG="$STAGING_DIR/$DMG_NAME"
+OUTPUT_DMG="$PROJECT_DIR/dist/$DMG_NAME"
+
+mkdir -p "$PROJECT_DIR/dist"
+hdiutil create \
+  -volname "Codex Not Sleep" \
+  -srcfolder "$DMG_ROOT" \
+  -format UDZO \
+  -ov \
+  "$STAGING_DMG"
+hdiutil verify "$STAGING_DMG"
+mv -f "$STAGING_DMG" "$OUTPUT_DMG"
+
+echo "$OUTPUT_DMG"
