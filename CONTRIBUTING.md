@@ -7,4 +7,4 @@ Contributions are welcome.
 3. Run `swift test`.
 4. Open a pull request explaining what changed and why.
 
-Methamphetamine requires macOS 13 or later and a Swift 6 toolchain.
+Codex Not Sleep requires macOS 13 or later and a Swift 6 toolchain.
