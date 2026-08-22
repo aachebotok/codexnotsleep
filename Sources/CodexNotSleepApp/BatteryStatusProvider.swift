@@ -10,7 +10,7 @@ struct BatteryStatus: Equatable, Sendable {
   }
 }
 
-protocol BatteryStatusProviding {
+protocol BatteryStatusProviding: Sendable {
   func currentStatus() -> BatteryStatus?
 }
 

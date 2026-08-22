@@ -189,7 +189,7 @@ struct PowerProtectTests {
     )
 
     do {
-      try await installer.install()
+      try installer.install()
       Issue.record("Expected setup cancellation")
     } catch let error as PowerProtectError {
       #expect(error == .setupCancelled)
@@ -411,7 +411,6 @@ private enum RecordingRunnerError: Error {
   case missingResult
 }
 
-@MainActor
 private final class RecordingPowerProtectAuthorizationRunner:
   PowerProtectAuthorizationRunning
 {
@@ -428,7 +427,6 @@ private final class RecordingPowerProtectAuthorizationRunner:
   }
 }
 
-@MainActor
 private final class PartialSleepProtectionBackend: SleepProtectionBackend {
   let identifier = "partial-fake"
   private(set) var isHeld: Bool
@@ -453,20 +451,19 @@ private final class PartialSleepProtectionBackend: SleepProtectionBackend {
   }
 }
 
-@MainActor
 private final class FakePowerProtectInstaller: PowerProtectInstalling {
   var isInstalled: Bool
+  var hasRuleFile: Bool { isInstalled }
 
   init(isInstalled: Bool) {
     self.isInstalled = isInstalled
   }
 
-  func install() async throws {
+  func install() throws {
     isInstalled = true
   }
 }
 
-@MainActor
 private final class FakePowerProtectWatchdog: PowerProtectWatchdogControlling {
   private(set) var startCount = 0
   private(set) var stopCount = 0

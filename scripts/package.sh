@@ -49,8 +49,11 @@ VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$STAG
 DMG_NAME="Codex-Not-Sleep-$VERSION.dmg"
 STAGING_DMG="$STAGING_DIR/$DMG_NAME"
 OUTPUT_DMG="$PROJECT_DIR/dist/$DMG_NAME"
+OUTPUT_APP="$PROJECT_DIR/dist/Codex Not Sleep.app"
 
 mkdir -p "$PROJECT_DIR/dist"
+rm -rf "$OUTPUT_APP"
+ditto "$STAGING_APP" "$OUTPUT_APP"
 hdiutil create \
   -volname "Codex Not Sleep" \
   -srcfolder "$DMG_ROOT" \
@@ -60,4 +63,5 @@ hdiutil create \
 hdiutil verify "$STAGING_DMG"
 mv -f "$STAGING_DMG" "$OUTPUT_DMG"
 
+echo "$OUTPUT_APP"
 echo "$OUTPUT_DMG"

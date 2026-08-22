@@ -6,16 +6,13 @@ let package = Package(
   platforms: [.macOS(.v13)],
   products: [
     .library(name: "CodexNotSleepCore", targets: ["CodexNotSleepCore"]),
-    .library(name: "CodexNotSleepUI", targets: ["CodexNotSleepUI"]),
     .executable(name: "CodexNotSleep", targets: ["CodexNotSleepApp"]),
-    .executable(name: "CodexNotSleepStorybook", targets: ["CodexNotSleepStorybook"]),
   ],
   targets: [
     .target(name: "CodexNotSleepCore"),
-    .target(name: "CodexNotSleepUI"),
     .executableTarget(
       name: "CodexNotSleepApp",
-      dependencies: ["CodexNotSleepCore", "CodexNotSleepUI"],
+      dependencies: ["CodexNotSleepCore"],
       linkerSettings: [
         .linkedFramework("AppKit"),
         .linkedFramework("IOKit"),
@@ -23,15 +20,10 @@ let package = Package(
         .linkedFramework("ServiceManagement"),
       ]
     ),
-    .executableTarget(
-      name: "CodexNotSleepStorybook",
-      dependencies: ["CodexNotSleepUI"],
-      linkerSettings: [.linkedFramework("AppKit")]
-    ),
     .testTarget(name: "CodexNotSleepCoreTests", dependencies: ["CodexNotSleepCore"]),
     .testTarget(
       name: "CodexNotSleepAppTests",
-      dependencies: ["CodexNotSleepApp", "CodexNotSleepCore", "CodexNotSleepUI"]),
+      dependencies: ["CodexNotSleepApp", "CodexNotSleepCore"]),
   ],
   swiftLanguageModes: [.v6]
 )

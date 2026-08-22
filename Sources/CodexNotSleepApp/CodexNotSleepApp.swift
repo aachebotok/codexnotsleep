@@ -1,57 +1,51 @@
 import AppKit
-import SwiftUI
-
-enum MenuBarPopoverMetrics {
-  static let contentSize = NSSize(width: 320, height: 126)
-  static let verticalGap: CGFloat = 4
-
-  @MainActor
-  static func positioningRect(for button: NSStatusBarButton) -> NSRect {
-    let imageRect = button.cell?.imageRect(forBounds: button.bounds) ?? button.bounds
-    guard imageRect.width > 0, imageRect.height > 0 else {
-      return button.bounds
-    }
-
-    return imageRect
-  }
-
-  static func alignedWindowFrame(
-    popoverFrame: NSRect,
-    statusItemFrame: NSRect
-  ) -> NSRect {
-    var frame = popoverFrame
-    frame.origin.y = statusItemFrame.minY - verticalGap - frame.height
-    return frame
-  }
-}
 
 @MainActor
-final class CodexNotSleepMenuBarController: NSObject {
+final class CodexNotSleepMenuBarController: NSObject, NSMenuDelegate {
   private let controller: AppController
   private var statusItem: NSStatusItem?
-  private let popover: NSPopover
+  private let menu = NSMenu()
+  private let stayAwakeItem = NSMenuItem(
+    title: "Stay Awake",
+    action: #selector(toggleProtection(_:)),
+    keyEquivalent: ""
+  )
+  private let issueItem = NSMenuItem(
+    title: "",
+    action: #selector(resolveIssue(_:)),
+    keyEquivalent: ""
+  )
+  private let issueSeparator = NSMenuItem.separator()
+  private let quitItem = NSMenuItem(
+    title: "Quit Codex Not Sleep",
+    action: #selector(quit(_:)),
+    keyEquivalent: "q"
+  )
 
   init(controller: AppController) {
     self.controller = controller
-    popover = NSPopover()
     super.init()
-
-    let hostingController = NSHostingController(
-      rootView: MenuContentView(controller: controller)
-    )
-    popover.contentViewController = hostingController
-    popover.behavior = .transient
-    popover.animates = true
-    popover.contentSize = MenuBarPopoverMetrics.contentSize
   }
 
   func install() {
-    // Keep the app as a menu-bar accessory. This is also required for macOS 26
-    // to register the status item with Control Center consistently.
     NSApplication.shared.setActivationPolicy(.accessory)
+
+    menu.delegate = self
+    menu.autoenablesItems = false
+    stayAwakeItem.target = self
+    issueItem.target = self
+    quitItem.target = self
+    quitItem.keyEquivalentModifierMask = [.command]
+
+    menu.addItem(stayAwakeItem)
+    menu.addItem(.separator())
+    menu.addItem(issueItem)
+    menu.addItem(issueSeparator)
+    menu.addItem(quitItem)
 
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     item.autosaveName = "CodexNotSleepStatusItem"
+    item.menu = menu
     item.isVisible = true
     statusItem = item
 
@@ -59,72 +53,55 @@ final class CodexNotSleepMenuBarController: NSObject {
       NSLog("Codex Not Sleep: status item button was not created")
       return
     }
-    let symbolConfiguration = NSImage.SymbolConfiguration(
-      pointSize: 16,
-      weight: .bold
-    )
+
     let image = NSImage(
       systemSymbolName: AppController.menuIconName,
       accessibilityDescription: "Codex Not Sleep"
-    )?.withSymbolConfiguration(symbolConfiguration)
-    if image == nil {
-      NSLog("Codex Not Sleep: menu-bar symbol was not available")
-    }
+    )
     image?.isTemplate = true
     button.image = image
     button.imageScaling = .scaleProportionallyDown
     button.imagePosition = .imageOnly
     button.toolTip = "Codex Not Sleep"
-    button.target = self
-    button.action = #selector(togglePopover(_:))
-    NSLog("Codex Not Sleep: status item installed (image: %@)", image == nil ? "no" : "yes")
+    updateMenu()
   }
 
-  @objc private func togglePopover(_ sender: Any?) {
-    guard let button = statusItem?.button else { return }
+  func menuWillOpen(_ menu: NSMenu) {
     controller.menuDidOpen()
+    updateMenu()
+  }
 
-    if popover.isShown {
-      popover.performClose(sender)
+  func menuNeedsUpdate(_ menu: NSMenu) {
+    updateMenu()
+  }
+
+  private func updateMenu() {
+    stayAwakeItem.state = controller.isProtectionEnabled ? .on : .off
+    stayAwakeItem.isEnabled = !controller.isPreparingProtection
+
+    if let issue = controller.menuIssue {
+      issueItem.title = issue.title
+      issueItem.isHidden = false
+      issueSeparator.isHidden = false
+      issueItem.isEnabled = !controller.isResolvingIssue
     } else {
-      // Anchor the arrow to the visible SF Symbol, not to the full-height
-      // status button. This keeps the panel optically close to the icon on
-      // menu bars with enlarged Liquid Glass hit areas.
-      let positioningRect = MenuBarPopoverMetrics.positioningRect(for: button)
-      popover.show(
-        relativeTo: positioningRect,
-        of: button,
-        preferredEdge: .minY
-      )
-      NSApplication.shared.activate(ignoringOtherApps: true)
-      popover.contentViewController?.view.window?.makeKey()
-      alignPopoverWindow(to: button)
-
-      // NSPopover may apply its own placement again while starting the show
-      // animation, so repeat the same deterministic alignment next run loop.
-      DispatchQueue.main.async { [weak self, weak button] in
-        guard let self, let button else { return }
-        self.popover.contentViewController?.view.window?.makeKey()
-        self.alignPopoverWindow(to: button)
-      }
+      issueItem.isHidden = true
+      issueSeparator.isHidden = true
     }
   }
 
-  private func alignPopoverWindow(to button: NSStatusBarButton) {
-    guard
-      let statusItemWindow = button.window,
-      let popoverWindow = popover.contentViewController?.view.window
-    else {
-      return
-    }
+  @objc private func toggleProtection(_ sender: Any?) {
+    controller.setProtectionEnabled(!controller.isProtectionEnabled)
+    updateMenu()
+  }
 
-    let buttonFrameInWindow = button.convert(button.bounds, to: nil)
-    let buttonFrameOnScreen = statusItemWindow.convertToScreen(buttonFrameInWindow)
-    let alignedFrame = MenuBarPopoverMetrics.alignedWindowFrame(
-      popoverFrame: popoverWindow.frame,
-      statusItemFrame: buttonFrameOnScreen
-    )
-    popoverWindow.setFrame(alignedFrame, display: true)
+  @objc private func resolveIssue(_ sender: Any?) {
+    controller.resolveMenuIssue()
+    updateMenu()
+  }
+
+  @objc private func quit(_ sender: Any?) {
+    controller.quit()
   }
 }
 

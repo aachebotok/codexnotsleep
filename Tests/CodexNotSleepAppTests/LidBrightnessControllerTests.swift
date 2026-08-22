@@ -196,6 +196,56 @@ struct LidBrightnessControllerTests {
   }
 
   @Test
+  func interpolationTimerExistsOnlyDuringARealTransition() {
+    let sensor = TestLidAngleSensor(angle: 90)
+    let display = TestDisplayBrightnessProvider(brightness: 0.8)
+    let controller = LidBrightnessController(
+      angleSensor: sensor,
+      displayProvider: display,
+      schedulesTimer: true
+    )
+
+    controller.setCodexWorking(true)
+    #expect(!controller.isInterpolationTimerActive)
+
+    let start = Date()
+    sensor.angle = 25
+    controller.refreshBrightness(at: start)
+    #expect(controller.isInterpolationTimerActive)
+
+    controller.refreshBrightness(
+      at: start.addingTimeInterval(LidBrightnessController.transitionDuration)
+    )
+    #expect(!controller.isInterpolationTimerActive)
+  }
+
+  @Test
+  func brightnessProviderFailureDisablesOnlyBrightnessAndRestoresState() {
+    let sensor = TestLidAngleSensor(angle: 90)
+    let display = TestDisplayBrightnessProvider(brightness: 0.8)
+    let controller = LidBrightnessController(
+      angleSensor: sensor,
+      displayProvider: display,
+      schedulesTimer: false
+    )
+
+    controller.setCodexWorking(true)
+    let start = Date()
+    sensor.angle = 25
+    controller.refreshBrightness(at: start)
+    controller.refreshBrightness(at: start.addingTimeInterval(0.05))
+    display.failNextWrite = true
+    controller.refreshBrightness(
+      at: start.addingTimeInterval(LidBrightnessController.transitionDuration)
+    )
+
+    #expect(display.writes.last?.brightness == 0.8)
+    sensor.angle = 20
+    controller.refreshBrightness(at: start.addingTimeInterval(1))
+    #expect(display.writes.last?.brightness == 0.8)
+  }
+
+  @Test
   func controllerDimsOnlyForConfirmedActiveCodexWork() {
     let suiteName = "CodexNotSleep.LidBrightnessTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!
@@ -209,7 +259,6 @@ struct LidBrightnessControllerTests {
     )
     let controller = AppController(
       defaults: defaults,
-      detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
       legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
       backend: LidBrightnessTestBackend(),
       codexActivityProvider: activity,
@@ -255,6 +304,7 @@ private final class TestDisplayBrightnessProvider: DisplayBrightnessProviding {
   let displayID: UInt32 = 42
   private(set) var brightness: Double
   private(set) var writes: [Write] = []
+  var failNextWrite = false
 
   init(brightness: Double) {
     self.brightness = brightness
@@ -265,6 +315,10 @@ private final class TestDisplayBrightnessProvider: DisplayBrightnessProviding {
   }
 
   func setBrightness(_ brightness: Double, for displayID: UInt32) -> Bool {
+    if failNextWrite {
+      failNextWrite = false
+      return false
+    }
     self.brightness = brightness
     writes.append(Write(brightness: brightness, displayID: displayID))
     return true
@@ -319,7 +373,6 @@ private final class RecordingLidBrightnessController: LidBrightnessControlling {
   }
 }
 
-@MainActor
 private final class LidBrightnessTestBackend: SleepProtectionBackend {
   let identifier = "lid-brightness-test"
   private(set) var isHeld = false

@@ -22,6 +22,17 @@ struct CodexLifecycleParserTests {
   }
 
   @Test
+  func parsesReorderedKeysWhitespaceAndExtraFieldsSemantically() throws {
+    let line = Data(
+      "  \t{ \"payload\": { \"extra\": true, \"turn_id\": \"turn-3\", \"type\": \"turn_started\" }, \"type\": \"event_msg\" }  \r"
+        .utf8
+    )
+
+    let event = try #require(CodexLifecycleParser.parse(line).event)
+    #expect(event == CodexLifecycleEvent(kind: .started, turnID: "turn-3", startedAt: nil))
+  }
+
+  @Test
   func acceptsAliasesAndAbortWithoutTurnID() throws {
     let started = try #require(
       CodexLifecycleParser.parse(
@@ -601,6 +612,8 @@ struct CodexSessionActivityMonitorTests {
   func fileSystemObserverReportsAChangedSessionFile() async throws {
     let fixture = try SessionFixture()
     let observer = FSEventsCodexSessionFileChangeObserver(sessionRoot: fixture.directory)
+    observer.start { }
+    defer { observer.stop() }
     let file = try fixture.makeRootSession(events: [start("background")])
     var observedPaths = Set<String>()
 

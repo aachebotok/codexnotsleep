@@ -106,12 +106,10 @@ enum PowerProtectAuthorizationEnvironment {
   }
 }
 
-@MainActor
 protocol PowerProtectAuthorizationRunning: AnyObject {
   func run(script source: String) -> PowerProtectCommandResult
 }
 
-@MainActor
 final class NSAppleScriptPowerProtectAuthorizationRunner: PowerProtectAuthorizationRunning {
   func run(script source: String) -> PowerProtectCommandResult {
     PowerProtectAuthorizationEnvironment.applyToCurrentProcess()
@@ -131,19 +129,22 @@ final class NSAppleScriptPowerProtectAuthorizationRunner: PowerProtectAuthorizat
   }
 }
 
-@MainActor
 protocol PowerProtectInstalling: AnyObject {
+  var hasRuleFile: Bool { get }
   var isInstalled: Bool { get }
-  func install() async throws
+  func install() throws
 }
 
-@MainActor
 final class PowerProtectInstaller: PowerProtectInstalling {
   static let authorizationPrompt =
     "Allow Codex Not Sleep to keep your Mac running with the lid closed. You'll only need to confirm once."
 
   static var authorizationPreviewAppleScript: String {
     "do shell script \"/usr/bin/true\" with prompt \"\(authorizationPrompt)\" with administrator privileges"
+  }
+
+  var hasRuleFile: Bool {
+    installationCheck()
   }
 
   var isInstalled: Bool {
@@ -174,7 +175,7 @@ final class PowerProtectInstaller: PowerProtectInstalling {
     self.installationCheck = check
   }
 
-  func install() async throws {
+  func install() throws {
     if isInstalled { return }
 
     let result = authorizationRunner.run(script: administratorAppleScript)
@@ -200,6 +201,7 @@ final class PowerProtectInstaller: PowerProtectInstalling {
   ]
 
   nonisolated static func sudoersPath(for userID: uid_t) -> String {
+    // Keep the historical path so existing installations can be recovered and removed.
     "/private/etc/sudoers.d/methamphetamine_power_protect_\(userID)"
   }
 
@@ -241,13 +243,11 @@ final class PowerProtectInstaller: PowerProtectInstalling {
   }
 }
 
-@MainActor
 protocol PowerProtectWatchdogControlling: AnyObject {
   func start(parentPID: Int32, leaseURL: URL, token: String) throws
   func stop()
 }
 
-@MainActor
 final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
   private var process: Process?
 
@@ -311,7 +311,6 @@ final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
     """
 }
 
-@MainActor
 final class PowerProtectLeaseStore {
   let url: URL
   private let fileManager: FileManager
@@ -326,7 +325,7 @@ final class PowerProtectLeaseStore {
         in: .userDomainMask
       ).first ?? fileManager.homeDirectoryForCurrentUser.appending(path: "Library/Application Support")
       self.url = applicationSupport
-        // Keep the existing directory so an update can recover an old lease.
+        // Keep the legacy directory so an update can recover an old lease.
         .appending(path: "Methamphetamine", directoryHint: .isDirectory)
         .appending(path: "power-protect.lease")
     }
@@ -351,12 +350,13 @@ final class PowerProtectLeaseStore {
   }
 }
 
-@MainActor
 final class PMSetPowerProtectBackend: SleepProtectionBackend {
   let identifier = "pmset closed-lid protection"
   private(set) var isHeld: Bool
 
-  var requiresSetup: Bool { !installer.isInstalled }
+  // Checking the rule file is cheap and safe during app startup. Permission
+  // verification is deferred to the worker that performs acquire/release.
+  var requiresSetup: Bool { !installer.hasRuleFile }
 
   private let installer: any PowerProtectInstalling
   private let runner: any PowerProtectCommandRunning
@@ -377,8 +377,8 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend {
     isHeld = leaseStore.hasLease
   }
 
-  func prepare() async throws {
-    try await installer.install()
+  func prepare() throws {
+    try installer.install()
   }
 
   func recover() throws {
@@ -388,7 +388,9 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend {
 
   func acquire() throws {
     guard !isHeld else { return }
-    guard !requiresSetup else { throw PowerProtectError.setupRequired }
+    guard !requiresSetup, installer.isInstalled else {
+      throw PowerProtectError.setupRequired
+    }
 
     if try sleepIsDisabled() {
       inheritedDisabledSleep = true
@@ -501,7 +503,6 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend {
   }
 }
 
-@MainActor
 final class CombinedSleepProtectionBackend: SleepProtectionBackend {
   let identifier = "IOPM + pmset closed-lid protection"
   var isHeld: Bool { idleSleep.isHeld || closedLid.isHeld }
@@ -518,8 +519,8 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend {
     self.closedLid = closedLid
   }
 
-  func prepare() async throws {
-    try await closedLid.prepare()
+  func prepare() throws {
+    try closedLid.prepare()
   }
 
   func recover() throws {

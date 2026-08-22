@@ -1,9 +1,8 @@
-@MainActor
 public protocol SleepProtectionBackend: AnyObject {
   var identifier: String { get }
   var isHeld: Bool { get }
   var requiresSetup: Bool { get }
-  func prepare() async throws
+  func prepare() throws
   func recover() throws
   func acquire() throws
   func renew() throws
@@ -12,6 +11,6 @@ public protocol SleepProtectionBackend: AnyObject {
 
 public extension SleepProtectionBackend {
   var requiresSetup: Bool { false }
-  func prepare() async throws {}
+  func prepare() throws {}
   func recover() throws {}
 }

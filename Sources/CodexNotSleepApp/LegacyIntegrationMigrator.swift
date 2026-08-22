@@ -1,7 +1,9 @@
 import Foundation
 import CodexNotSleepCore
 
-final class LegacyIntegrationMigrator {
+// Immutable path configuration; individual migration calls are serialized by
+// the controller's maintenance queue.
+final class LegacyIntegrationMigrator: @unchecked Sendable {
   private let homeDirectory: URL
 
   init(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) {
@@ -38,6 +40,7 @@ final class LegacyIntegrationMigrator {
 
   private func backup(_ data: Data, for url: URL) throws {
     let safeDate = ISO8601DateFormatter().string(from: .now).replacing(":", with: "-")
+    // Keep the old extension so users can identify and restore migration backups.
     let backupURL = url.appendingPathExtension("methamphetamine-backup-\(safeDate)")
     try data.write(to: backupURL, options: [.atomic])
   }

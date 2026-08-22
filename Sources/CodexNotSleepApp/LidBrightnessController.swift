@@ -3,13 +3,19 @@ import CoreFoundation
 import CoreGraphics
 import Darwin
 import IOKit
-import IOKit.graphics
 import IOKit.hid
 import ObjectiveC.runtime
 
 @MainActor
 protocol LidAngleProviding: AnyObject {
   func currentAngle() -> Double?
+  func startMonitoring(onChange: @escaping (Double) -> Void)
+  func stopMonitoring()
+}
+
+extension LidAngleProviding {
+  func startMonitoring(onChange: @escaping (Double) -> Void) {}
+  func stopMonitoring() {}
 }
 
 @MainActor
@@ -25,6 +31,8 @@ final class IOKitLidAngleSensor: LidAngleProviding {
   private var manager: IOHIDManager?
   private var device: IOHIDDevice?
   private var angleElement: IOHIDElement?
+  private var angleHandler: ((Double) -> Void)?
+  private var callbackQueue: DispatchQueue?
 
   func currentAngle() -> Double? {
     guard ensureDevice() else { return nil }
@@ -42,6 +50,19 @@ final class IOKitLidAngleSensor: LidAngleProviding {
     return rawAngle <= 1
       ? 0
       : min(Double(rawAngle), LidBrightnessCurve.sensorMaximumAngle)
+  }
+
+  func startMonitoring(onChange: @escaping (Double) -> Void) {
+    angleHandler = onChange
+    guard ensureDevice() else { return }
+    if let angle = currentAngle() {
+      onChange(angle)
+    }
+  }
+
+  func stopMonitoring() {
+    angleHandler = nil
+    disconnect()
   }
 
   private func ensureDevice() -> Bool {
@@ -65,11 +86,34 @@ final class IOKitLidAngleSensor: LidAngleProviding {
     ]
     IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
 
+    let callbackQueue = DispatchQueue(
+      label: "app.codexnotsleep.lid-angle-events",
+      qos: .userInitiated
+    )
+    IOHIDManagerRegisterInputValueCallback(
+      manager,
+      Self.inputValueCallback,
+      Unmanaged.passUnretained(self).toOpaque()
+    )
+    IOHIDManagerRegisterDeviceMatchingCallback(
+      manager,
+      Self.deviceMatchingCallback,
+      Unmanaged.passUnretained(self).toOpaque()
+    )
+    IOHIDManagerRegisterDeviceRemovalCallback(
+      manager,
+      Self.deviceRemovalCallback,
+      Unmanaged.passUnretained(self).toOpaque()
+    )
+    IOHIDManagerSetDispatchQueue(manager, callbackQueue)
+    self.callbackQueue = callbackQueue
+    self.manager = manager
+
     guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess
     else {
+      disconnect()
       return false
     }
-    self.manager = manager
 
     guard let devices = IOHIDManagerCopyDevices(manager) else {
       disconnect()
@@ -138,6 +182,7 @@ final class IOKitLidAngleSensor: LidAngleProviding {
   }
 
   private func disconnect() {
+    callbackQueue = nil
     angleElement = nil
     if let device {
       IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -147,6 +192,63 @@ final class IOKitLidAngleSensor: LidAngleProviding {
       IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
       self.manager = nil
     }
+  }
+
+  private func handleInputValue(_ value: IOHIDValue) {
+    let element = IOHIDValueGetElement(value)
+    guard IOHIDElementGetUsagePage(element) == Self.usagePage,
+      IOHIDElementGetUsage(element) == Self.angleUsage
+    else { return }
+
+    let rawAngle = IOHIDValueGetIntegerValue(value)
+    let angle = rawAngle <= 1
+      ? 0.0
+      : min(Double(rawAngle), LidBrightnessCurve.sensorMaximumAngle)
+    Task { @MainActor [weak self] in
+      self?.angleHandler?(angle)
+    }
+  }
+
+  private func handleDeviceMatching() {
+    Task { @MainActor [weak self] in
+      guard let self, self.angleHandler != nil, self.device == nil else { return }
+      guard ensureDevice(), let angle = currentAngle() else { return }
+      angleHandler?(angle)
+    }
+  }
+
+  private func handleDeviceRemoval() {
+    Task { @MainActor [weak self] in
+      guard let self, self.angleHandler != nil else { return }
+      disconnect()
+    }
+  }
+
+  private static let inputValueCallback: IOHIDValueCallback = {
+    context, _, _, value in
+    guard let context else { return }
+    let sensor = Unmanaged<IOKitLidAngleSensor>
+      .fromOpaque(context)
+      .takeUnretainedValue()
+    sensor.handleInputValue(value)
+  }
+
+  private static let deviceMatchingCallback: IOHIDDeviceCallback = {
+    context, _, _, _ in
+    guard let context else { return }
+    let sensor = Unmanaged<IOKitLidAngleSensor>
+      .fromOpaque(context)
+      .takeUnretainedValue()
+    sensor.handleDeviceMatching()
+  }
+
+  private static let deviceRemovalCallback: IOHIDDeviceCallback = {
+    context, _, _, _ in
+    guard let context else { return }
+    let sensor = Unmanaged<IOKitLidAngleSensor>
+      .fromOpaque(context)
+      .takeUnretainedValue()
+    sensor.handleDeviceRemoval()
   }
 }
 
@@ -363,20 +465,11 @@ final class SystemDisplayBrightnessProvider: DisplayBrightnessProviding {
     let value = Float(min(max(brightness, 0), 1))
     let displayID = CGDirectDisplayID(displayID)
 
-    if let setDisplayServicesBrightness,
-       setDisplayServicesBrightness(displayID, value) == kIOReturnSuccess
-    {
-      return true
-    }
-
-    return withFirstDisplayService { service in
-      IODisplaySetFloatParameter(
-        service,
-        0,
-        kIODisplayBrightnessKey as CFString,
-        value
-      ) == kIOReturnSuccess
-    } ?? false
+    // DisplayServices accepts the exact CGDirectDisplayID. If it is not
+    // available, fail safely instead of guessing from the first IODisplayConnect
+    // service, which can be an external display.
+    guard let setDisplayServicesBrightness else { return false }
+    return setDisplayServicesBrightness(displayID, value) == kIOReturnSuccess
   }
 
   private func builtInDisplayID() -> UInt32? {
@@ -411,35 +504,7 @@ final class SystemDisplayBrightnessProvider: DisplayBrightnessProviding {
       }
     }
 
-    return withFirstDisplayService { service in
-      var value: Float = 0
-      guard
-        IODisplayGetFloatParameter(
-          service,
-          0,
-          kIODisplayBrightnessKey as CFString,
-          &value
-        ) == kIOReturnSuccess
-      else { return nil }
-      return min(max(Double(value), 0), 1)
-    }
-  }
-
-  private func withFirstDisplayService<T>(_ body: (io_service_t) -> T?) -> T? {
-    var iterator: io_iterator_t = 0
-    guard
-      IOServiceGetMatchingServices(
-        kIOMainPortDefault,
-        IOServiceMatching("IODisplayConnect"),
-        &iterator
-      ) == KERN_SUCCESS
-    else { return nil }
-    defer { IOObjectRelease(iterator) }
-
-    let service = IOIteratorNext(iterator)
-    guard service != 0 else { return nil }
-    defer { IOObjectRelease(service) }
-    return body(service)
+    return nil
   }
 
   private static func function<T>(
@@ -477,6 +542,7 @@ final class LidBrightnessController: LidBrightnessControlling {
   // The lid sensor reports whole degrees. This short interpolation only fills
   // the gaps between adjacent readings; the target always comes from the angle.
   static let transitionDuration: TimeInterval = 0.15
+  private static let transitionCompletionTolerance: TimeInterval = 0.001
 
   private let angleSensor: any LidAngleProviding
   private let displayProvider: any DisplayBrightnessProviding
@@ -486,6 +552,9 @@ final class LidBrightnessController: LidBrightnessControlling {
   private var keyboardStates: [UInt64: BrightnessState] = [:]
   private var timer: Timer?
   private var isCodexWorking = false
+  private var isBrightnessFeatureDisabled = false
+
+  var isInterpolationTimerActive: Bool { timer != nil }
 
   init(
     angleSensor: any LidAngleProviding,
@@ -511,26 +580,40 @@ final class LidBrightnessController: LidBrightnessControlling {
     if isWorking {
       if !isCodexWorking {
         isCodexWorking = true
+        isBrightnessFeatureDisabled = false
+        angleSensor.startMonitoring { [weak self] angle in
+          self?.handleAngle(angle)
+        }
         refreshBrightness()
       }
-      ensureTimer()
       return
     }
 
     guard isCodexWorking || !displayStates.isEmpty || !keyboardStates.isEmpty else { return }
     isCodexWorking = false
+    angleSensor.stopMonitoring()
     restoreBrightness()
   }
 
   func reset() {
     isCodexWorking = false
+    angleSensor.stopMonitoring()
     restoreBrightness(stopping: true)
   }
 
   func refreshBrightness(at date: Date = .now) {
     guard isCodexWorking else { return }
+    refreshBrightness(at: date, angle: angleSensor.currentAngle())
+  }
 
-    if let angle = angleSensor.currentAngle() {
+  private func handleAngle(_ angle: Double) {
+    refreshBrightness(at: .now, angle: angle)
+  }
+
+  private func refreshBrightness(at date: Date, angle: Double?) {
+    guard isCodexWorking, !isBrightnessFeatureDisabled else { return }
+
+    if let angle {
       if angle >= LidBrightnessCurve.restorationAngle {
         restoreBrightness(stopping: false)
         return
@@ -571,9 +654,10 @@ final class LidBrightnessController: LidBrightnessControlling {
     }
     displayStates.removeAll()
     keyboardStates.removeAll()
+    timer?.invalidate()
+    timer = nil
     if stopping {
-      timer?.invalidate()
-      timer = nil
+      angleSensor.stopMonitoring()
     }
   }
 
@@ -581,7 +665,7 @@ final class LidBrightnessController: LidBrightnessControlling {
     guard schedulesTimer, timer == nil else { return }
     let timer = Timer(timeInterval: Self.frameInterval, repeats: true) { [weak self] _ in
       Task { @MainActor in
-        self?.refreshBrightness()
+        self?.advanceTransitions(at: .now)
       }
     }
     timer.tolerance = 0.002
@@ -590,6 +674,7 @@ final class LidBrightnessController: LidBrightnessControlling {
   }
 
   private func updateTargets(for angle: Double, at date: Date) {
+    var hasTransition = false
     for id in displayStates.keys {
       guard var state = displayStates[id] else { continue }
       let target = LidBrightnessCurve.targetBrightness(original: state.original, angle: angle)
@@ -597,6 +682,7 @@ final class LidBrightnessController: LidBrightnessControlling {
       state.transitionFrom = state.current
       state.target = target
       state.transitionStartedAt = date
+      hasTransition = true
       displayStates[id] = state
     }
 
@@ -610,30 +696,45 @@ final class LidBrightnessController: LidBrightnessControlling {
       state.transitionFrom = state.current
       state.target = target
       state.transitionStartedAt = date
+      hasTransition = true
       keyboardStates[id] = state
     }
+    if hasTransition { ensureTimer() }
   }
 
   private func advanceTransitions(at date: Date) {
+    var writeFailed = false
     for id in displayStates.keys {
       guard var state = displayStates[id],
             let transitionStartedAt = state.transitionStartedAt
       else { continue }
 
       let elapsed = date.timeIntervalSince(transitionStartedAt)
-      let progress = min(max(elapsed / Self.transitionDuration, 0), 1)
+      let isComplete = elapsed >= Self.transitionDuration - Self.transitionCompletionTolerance
+      let progress = isComplete
+        ? 1
+        : min(max(elapsed / Self.transitionDuration, 0), 1)
       let easedProgress = LidBrightnessCurve.smoothProgress(progress)
       let value = state.transitionFrom
         + (state.target - state.transitionFrom) * easedProgress
-      guard abs(value - state.current) > 0.0005 else { continue }
-      guard displayProvider.setBrightness(value, for: id) else { continue }
+      if abs(value - state.current) > 0.0005 {
+        guard displayProvider.setBrightness(value, for: id) else {
+          writeFailed = true
+          break
+        }
+        state.current = value
+      }
 
-      state.current = value
-      if progress >= 1 {
+      if isComplete {
         state.current = state.target
         state.transitionStartedAt = nil
       }
       displayStates[id] = state
+    }
+
+    if writeFailed {
+      disableBrightnessFeature()
+      return
     }
 
     for id in keyboardStates.keys {
@@ -642,19 +743,43 @@ final class LidBrightnessController: LidBrightnessControlling {
       else { continue }
 
       let elapsed = date.timeIntervalSince(transitionStartedAt)
-      let progress = min(max(elapsed / Self.transitionDuration, 0), 1)
+      let isComplete = elapsed >= Self.transitionDuration - Self.transitionCompletionTolerance
+      let progress = isComplete
+        ? 1
+        : min(max(elapsed / Self.transitionDuration, 0), 1)
       let easedProgress = LidBrightnessCurve.smoothProgress(progress)
       let value = state.transitionFrom
         + (state.target - state.transitionFrom) * easedProgress
-      guard abs(value - state.current) > 0.0005 else { continue }
-      guard keyboardProvider.setBrightness(value, for: id) else { continue }
+      if abs(value - state.current) > 0.0005 {
+        guard keyboardProvider.setBrightness(value, for: id) else {
+          writeFailed = true
+          break
+        }
+        state.current = value
+      }
 
-      state.current = value
-      if progress >= 1 {
+      if isComplete {
         state.current = state.target
         state.transitionStartedAt = nil
       }
       keyboardStates[id] = state
     }
+
+    if writeFailed {
+      disableBrightnessFeature()
+      return
+    }
+
+    let hasActiveTransition = displayStates.values.contains { $0.transitionStartedAt != nil }
+      || keyboardStates.values.contains { $0.transitionStartedAt != nil }
+    if !hasActiveTransition {
+      timer?.invalidate()
+      timer = nil
+    }
+  }
+
+  private func disableBrightnessFeature() {
+    isBrightnessFeatureDisabled = true
+    restoreBrightness(stopping: false)
   }
 }

@@ -115,7 +115,6 @@ struct LaunchAtLoginControllerTests {
     )
     let controller = AppController(
       defaults: defaults,
-      detector: CodingAgentSystemScanner(homeDirectory: fixtureHome, environment: [:]),
       legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
       backend: LaunchAtLoginTestSleepProtectionBackend(),
       launchAtLoginController: launchAtLogin,
@@ -166,7 +165,6 @@ private final class RecordingLaunchAtLoginController: LaunchAtLoginControlling {
   }
 }
 
-@MainActor
 private final class LaunchAtLoginTestSleepProtectionBackend: SleepProtectionBackend {
   let identifier = "launch-at-login-test"
   var isHeld = false

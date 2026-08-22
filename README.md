@@ -43,7 +43,7 @@ If **Open Anyway** is not visible, try opening the app from **Applications** aga
 - Allows normal sleep when the battery reaches 10% or lower
 - Runs locally with no account, analytics, or API connection
 
-Codex Not Sleep lives entirely in the menu bar. Use the **Stay awake** switch to enable or disable automatic protection at any time.
+Codex Not Sleep lives entirely in the menu bar. Use the native **Stay Awake** menu item to enable or disable automatic protection at any time. Setup and sleep-recovery actions appear only when needed.
 
 > Keeping a Mac awake with its lid closed can use more battery and generate heat. Do not leave an active Mac inside a bag or another enclosed space.
 
@@ -51,7 +51,7 @@ Codex Not Sleep lives entirely in the menu bar. Use the **Stay awake** switch to
 
 Codex Not Sleep reads lifecycle markers from local Codex session files to determine when a task starts and finishes. It does not store or send your prompts, responses, or source code.
 
-Closed-lid operation requires a one-time administrator confirmation. The app installs a narrow `sudoers` rule that permits only the two required `pmset` commands. Remove that rule with:
+Closed-lid operation requires a one-time administrator confirmation. The app installs a narrow `sudoers` rule that permits only the two required `pmset` commands. The historical filename is retained so existing installations can be recovered and removed. Remove that rule with:
 
 ```bash
 sudo rm /private/etc/sudoers.d/methamphetamine_power_protect_$(id -u)
@@ -63,9 +63,12 @@ Requirements: macOS 13 or later, Xcode, and a Swift 6 toolchain.
 
 ```bash
 swift test
+swift build -c release
 ./scripts/package.sh
 ```
 
-The packaging script creates a universal, ad-hoc signed DMG at `dist/Codex-Not-Sleep-1.0.0.dmg`. Public releases must be signed with Developer ID and notarized by Apple.
+The packaging script creates a universal, ad-hoc signed app at `dist/Codex Not Sleep.app` and DMG at `dist/Codex-Not-Sleep-1.0.0.dmg`. Public releases must be signed with Developer ID and notarized by Apple.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance and [SECURITY.md](SECURITY.md) for security reporting.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the event-driven monitoring, sleep-state ownership, and brightness recovery invariants.

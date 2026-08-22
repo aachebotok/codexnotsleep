@@ -21,6 +21,7 @@ public enum LegacyHookConfigurationError: Error {
 }
 
 public enum LegacyHookConfiguration {
+  // This marker identifies hooks owned by the predecessor app during migration.
   public static let marker = "methamphetamine-hook"
 
   public static func removing(data: Data, integration: IntegrationKind) throws -> Data {

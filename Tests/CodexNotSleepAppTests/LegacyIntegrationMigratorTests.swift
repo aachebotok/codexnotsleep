@@ -56,7 +56,6 @@ struct LegacyIntegrationMigratorTests {
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let controller = AppController(
       defaults: defaults,
-      detector: CodingAgentSystemScanner(homeDirectory: root, environment: [:]),
       legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: root),
       backend: FakeMigrationSleepProtectionBackend(),
       startsAutomatically: false
@@ -95,7 +94,6 @@ struct LegacyIntegrationMigratorTests {
   }
 }
 
-@MainActor
 private final class FakeMigrationSleepProtectionBackend: SleepProtectionBackend {
   let identifier = "fake-migration"
   private(set) var isHeld = false

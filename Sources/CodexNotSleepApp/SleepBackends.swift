@@ -13,7 +13,6 @@ enum BackendError: LocalizedError {
   }
 }
 
-@MainActor
 final class IdleSleepAssertionBackend: SleepProtectionBackend {
   let identifier = "IOPM idle-sleep assertion"
   private(set) var isHeld = false

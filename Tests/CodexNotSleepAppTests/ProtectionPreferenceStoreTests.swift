@@ -5,30 +5,30 @@ import Testing
 
 @Suite
 @MainActor
-struct AgentProtectionStoreTests {
+struct ProtectionPreferenceStoreTests {
   @Test
   func missingPreferenceStartsDisabledAndPersistsExplicitChoice() throws {
-    let suiteName = "CodexNotSleep.AgentProtectionStoreTests.\(UUID().uuidString)"
+    let suiteName = "CodexNotSleep.ProtectionPreferenceStoreTests.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
 
-    let store = AgentProtectionStore(defaults: defaults)
+    let store = ProtectionPreferenceStore(defaults: defaults)
     #expect(!store.hasStoredPreference)
     #expect(!store.load())
 
     store.save(true)
 
-    let restoredStore = AgentProtectionStore(defaults: defaults)
+    let restoredStore = ProtectionPreferenceStore(defaults: defaults)
     #expect(restoredStore.hasStoredPreference)
     #expect(restoredStore.load())
   }
 
   @Test
   func legacyAgentSelectionMapsToGlobalPreference() throws {
-    let suiteName = "CodexNotSleep.AgentProtectionStoreTests.\(UUID().uuidString)"
+    let suiteName = "CodexNotSleep.ProtectionPreferenceStoreTests.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
-    let store = AgentProtectionStore(defaults: defaults)
+    let store = ProtectionPreferenceStore(defaults: defaults)
 
     defaults.set(["codex"], forKey: "enabledCodingAgentIDs")
     #expect(store.load())
@@ -39,21 +39,21 @@ struct AgentProtectionStoreTests {
 
   @Test
   func globalPreferenceOverridesLegacySelection() throws {
-    let suiteName = "CodexNotSleep.AgentProtectionStoreTests.\(UUID().uuidString)"
+    let suiteName = "CodexNotSleep.ProtectionPreferenceStoreTests.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
     defaults.set(["codex"], forKey: "enabledCodingAgentIDs")
     defaults.set(false, forKey: "agentSleepProtectionEnabled")
 
-    let store = AgentProtectionStore(defaults: defaults)
+    let store = ProtectionPreferenceStore(defaults: defaults)
 
     #expect(!store.load())
   }
 
   @Test
   func migratesPreferencesFromPreviousBundleIdentifierOnce() throws {
-    let currentSuiteName = "CodexNotSleep.AgentProtectionStoreTests.current.\(UUID().uuidString)"
-    let legacySuiteName = "CodexNotSleep.AgentProtectionStoreTests.legacy.\(UUID().uuidString)"
+    let currentSuiteName = "CodexNotSleep.ProtectionPreferenceStoreTests.current.\(UUID().uuidString)"
+    let legacySuiteName = "CodexNotSleep.ProtectionPreferenceStoreTests.legacy.\(UUID().uuidString)"
     let currentDefaults = try #require(UserDefaults(suiteName: currentSuiteName))
     let legacyDefaults = try #require(UserDefaults(suiteName: legacySuiteName))
     defer {
@@ -61,9 +61,9 @@ struct AgentProtectionStoreTests {
       legacyDefaults.removePersistentDomain(forName: legacySuiteName)
     }
 
-    legacyDefaults.set(true, forKey: AgentProtectionStore.key)
-    legacyDefaults.set(true, forKey: AgentProtectionStore.pendingPowerProtectKey)
-    legacyDefaults.set(["codex"], forKey: AgentProtectionStore.legacySelectionKey)
+    legacyDefaults.set(true, forKey: ProtectionPreferenceStore.key)
+    legacyDefaults.set(true, forKey: ProtectionPreferenceStore.pendingPowerProtectKey)
+    legacyDefaults.set(["codex"], forKey: ProtectionPreferenceStore.legacySelectionKey)
 
     let migrator = LegacyPreferencesMigrator(
       defaults: currentDefaults,
@@ -71,19 +71,19 @@ struct AgentProtectionStoreTests {
     )
     migrator.migrate()
 
-    #expect(currentDefaults.bool(forKey: AgentProtectionStore.key))
-    #expect(currentDefaults.bool(forKey: AgentProtectionStore.pendingPowerProtectKey))
-    #expect(currentDefaults.stringArray(forKey: AgentProtectionStore.legacySelectionKey) == ["codex"])
+    #expect(currentDefaults.bool(forKey: ProtectionPreferenceStore.key))
+    #expect(currentDefaults.bool(forKey: ProtectionPreferenceStore.pendingPowerProtectKey))
+    #expect(currentDefaults.stringArray(forKey: ProtectionPreferenceStore.legacySelectionKey) == ["codex"])
 
-    legacyDefaults.set(false, forKey: AgentProtectionStore.key)
+    legacyDefaults.set(false, forKey: ProtectionPreferenceStore.key)
     migrator.migrate()
-    #expect(currentDefaults.bool(forKey: AgentProtectionStore.key))
+    #expect(currentDefaults.bool(forKey: ProtectionPreferenceStore.key))
   }
 
   @Test
   func migrationDoesNotOverwriteCurrentPreferences() throws {
-    let currentSuiteName = "CodexNotSleep.AgentProtectionStoreTests.current.\(UUID().uuidString)"
-    let legacySuiteName = "CodexNotSleep.AgentProtectionStoreTests.legacy.\(UUID().uuidString)"
+    let currentSuiteName = "CodexNotSleep.ProtectionPreferenceStoreTests.current.\(UUID().uuidString)"
+    let legacySuiteName = "CodexNotSleep.ProtectionPreferenceStoreTests.legacy.\(UUID().uuidString)"
     let currentDefaults = try #require(UserDefaults(suiteName: currentSuiteName))
     let legacyDefaults = try #require(UserDefaults(suiteName: legacySuiteName))
     defer {
@@ -91,15 +91,15 @@ struct AgentProtectionStoreTests {
       legacyDefaults.removePersistentDomain(forName: legacySuiteName)
     }
 
-    currentDefaults.set(false, forKey: AgentProtectionStore.key)
-    legacyDefaults.set(true, forKey: AgentProtectionStore.key)
+    currentDefaults.set(false, forKey: ProtectionPreferenceStore.key)
+    legacyDefaults.set(true, forKey: ProtectionPreferenceStore.key)
 
     LegacyPreferencesMigrator(
       defaults: currentDefaults,
       legacyDefaults: legacyDefaults
     ).migrate()
 
-    #expect(currentDefaults.object(forKey: AgentProtectionStore.key) != nil)
-    #expect(!currentDefaults.bool(forKey: AgentProtectionStore.key))
+    #expect(currentDefaults.object(forKey: ProtectionPreferenceStore.key) != nil)
+    #expect(!currentDefaults.bool(forKey: ProtectionPreferenceStore.key))
   }
 }

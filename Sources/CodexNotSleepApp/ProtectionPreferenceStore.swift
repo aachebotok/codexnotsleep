@@ -1,10 +1,12 @@
 import Foundation
 
 @MainActor
-final class AgentProtectionStore {
+final class ProtectionPreferenceStore {
   nonisolated static let key = "agentSleepProtectionEnabled"
   nonisolated static let pendingPowerProtectKey = "pendingPowerProtectEnable"
+  // Retained only to migrate the old per-agent preference to the global toggle.
   nonisolated static let legacySelectionKey = "enabledCodingAgentIDs"
+
   private let defaults: UserDefaults
 
   init(defaults: UserDefaults = .standard) {
@@ -43,14 +45,17 @@ final class AgentProtectionStore {
 }
 
 struct LegacyPreferencesMigrator {
+  // Existing installations still use the renamed app's preference domain.
   static let legacyBundleIdentifier = "app.methamphetamine.Methamphetamine"
+  // Retained so preference migration remains one-time and idempotent.
   static let migrationVersionKey = "methamphetaminePreferencesMigrationVersion"
   static let migrationVersion = 1
 
   private static let migratedKeys = [
-    AgentProtectionStore.key,
-    AgentProtectionStore.pendingPowerProtectKey,
-    AgentProtectionStore.legacySelectionKey,
+    ProtectionPreferenceStore.key,
+    ProtectionPreferenceStore.pendingPowerProtectKey,
+    // Migration compatibility for the old per-agent selection key.
+    ProtectionPreferenceStore.legacySelectionKey,
   ]
 
   private let defaults: UserDefaults

@@ -31,10 +31,17 @@ protocol CodexActivityProviding: AnyObject {
   func refresh() -> CodexActivitySnapshot
 
   func reset()
+
+  /// Starts the event source used by the live app. Test doubles can use the
+  /// default no-op implementation and continue to drive `refresh()` directly.
+  func startMonitoring(onChange: @escaping @Sendable () -> Void)
+  func stopMonitoring()
 }
 
 extension CodexActivityProviding {
   func reset() {}
+  func startMonitoring(onChange: @escaping @Sendable () -> Void) {}
+  func stopMonitoring() {}
 }
 
 struct CodexOpenSessionFile: Equatable, Sendable {
@@ -82,7 +89,14 @@ protocol CodexSessionFileChangeObserving: AnyObject {
   func takeChanges() -> CodexSessionFileChanges
 }
 
-final class FSEventsCodexSessionFileChangeObserver: CodexSessionFileChangeObserving {
+private protocol CodexSessionFileChangeNotifying: AnyObject {
+  func start(onChange: @escaping @Sendable () -> Void)
+  func stop()
+}
+
+final class FSEventsCodexSessionFileChangeObserver:
+  CodexSessionFileChangeObserving, CodexSessionFileChangeNotifying
+{
   private let lock = NSLock()
   private let queue = DispatchQueue(
     label: "app.codexnotsleep.codex-session-events",
@@ -90,6 +104,8 @@ final class FSEventsCodexSessionFileChangeObserver: CodexSessionFileChangeObserv
   )
   private var pendingChanges = CodexSessionFileChanges()
   private var stream: FSEventStreamRef?
+  private var changeHandler: (@Sendable () -> Void)?
+  private var isStarted = false
 
   init(sessionRoot: URL) {
     var context = FSEventStreamContext(
@@ -112,22 +128,43 @@ final class FSEventsCodexSessionFileChangeObserver: CodexSessionFileChangeObserv
       0.1,
       flags
     )
-    guard let stream else {
+    guard let stream = self.stream else {
       pendingChanges.requiresFullScan = true
       return
     }
     FSEventStreamSetDispatchQueue(stream, queue)
-    if !FSEventStreamStart(stream) {
-      pendingChanges.requiresFullScan = true
-    }
   }
 
   deinit {
     if let stream {
-      FSEventStreamStop(stream)
+      stop()
       FSEventStreamInvalidate(stream)
       FSEventStreamRelease(stream)
     }
+  }
+
+  func start(onChange: @escaping @Sendable () -> Void) {
+    lock.withLock {
+      changeHandler = onChange
+    }
+    guard let stream, !isStarted else { return }
+    guard FSEventStreamStart(stream) else {
+      lock.withLock {
+        pendingChanges.requiresFullScan = true
+      }
+      return
+    }
+    isStarted = true
+  }
+
+  func stop() {
+    guard let stream, isStarted else {
+      lock.withLock { changeHandler = nil }
+      return
+    }
+    FSEventStreamStop(stream)
+    isStarted = false
+    lock.withLock { changeHandler = nil }
   }
 
   func takeChanges() -> CodexSessionFileChanges {
@@ -143,6 +180,7 @@ final class FSEventsCodexSessionFileChangeObserver: CodexSessionFileChangeObserv
     flags: UnsafePointer<FSEventStreamEventFlags>,
     count: Int
   ) {
+    var handler: (@Sendable () -> Void)?
     lock.withLock {
       for index in 0..<count {
         let eventFlags = flags[index]
@@ -161,7 +199,9 @@ final class FSEventsCodexSessionFileChangeObserver: CodexSessionFileChangeObserv
           pendingChanges.paths.insert(paths[index])
         }
       }
+      handler = changeHandler
     }
+    handler?()
   }
 
   private static let callback: FSEventStreamCallback = {
@@ -179,7 +219,12 @@ final class FSEventsCodexSessionFileChangeObserver: CodexSessionFileChangeObserv
   }
 }
 
-final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating {
+protocol CodexOpenSessionEventSource: AnyObject {
+  func startMonitoring(onChange: @escaping @Sendable () -> Void)
+  func stopMonitoring()
+}
+
+final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenSessionEventSource {
   private static let discoveryInterval: TimeInterval = 30
   private static let processStartTolerance: TimeInterval = 5
 
@@ -267,6 +312,14 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating {
       files: files,
       isReliable: readableProcessCount == codexProcesses.count && discoveryWasReliable
     )
+  }
+
+  func startMonitoring(onChange: @escaping @Sendable () -> Void) {
+    (changeObserver as? CodexSessionFileChangeNotifying)?.start(onChange: onChange)
+  }
+
+  func stopMonitoring() {
+    (changeObserver as? CodexSessionFileChangeNotifying)?.stop()
   }
 
   private func applyFileChanges(runtimeStartedAt: Date) {
@@ -493,12 +546,6 @@ enum CodexLifecycleParseResult: Equatable, Sendable {
 }
 
 enum CodexLifecycleParser {
-  private struct Marker {
-    let bytes: Data
-    let lifecycleToken: Data
-    let kind: CodexLifecycleEventKind
-  }
-
   struct PositionedEvent {
     let offset: Int
     let event: CodexLifecycleEvent
@@ -509,46 +556,8 @@ enum CodexLifecycleParser {
     let malformedOffsets: [Int]
   }
 
-  private static let taskStartedToken = Data(#""type":"task_started""#.utf8)
-  private static let turnStartedToken = Data(#""type":"turn_started""#.utf8)
-  private static let taskCompleteToken = Data(#""type":"task_complete""#.utf8)
-  private static let turnCompleteToken = Data(#""type":"turn_complete""#.utf8)
-  private static let turnAbortedToken = Data(#""type":"turn_aborted""#.utf8)
-
-  private static let markers: [Marker] = [
-    Marker(
-      bytes: Data(#""type":"event_msg","payload":{"type":"task_started""#.utf8),
-      lifecycleToken: taskStartedToken,
-      kind: .started
-    ),
-    Marker(
-      bytes: Data(#""type":"event_msg","payload":{"type":"turn_started""#.utf8),
-      lifecycleToken: turnStartedToken,
-      kind: .started
-    ),
-    Marker(
-      bytes: Data(#""type":"event_msg","payload":{"type":"task_complete""#.utf8),
-      lifecycleToken: taskCompleteToken,
-      kind: .completed
-    ),
-    Marker(
-      bytes: Data(#""type":"event_msg","payload":{"type":"turn_complete""#.utf8),
-      lifecycleToken: turnCompleteToken,
-      kind: .completed
-    ),
-    Marker(
-      bytes: Data(#""type":"event_msg","payload":{"type":"turn_aborted""#.utf8),
-      lifecycleToken: turnAbortedToken,
-      kind: .completed
-    ),
-  ]
-
-  private static let lifecycleTokens = [
-    taskStartedToken,
-    turnStartedToken,
-    taskCompleteToken,
-    turnCompleteToken,
-    turnAbortedToken,
+  private static let lifecycleTypes: Set<String> = [
+    "task_started", "turn_started", "task_complete", "turn_complete", "turn_aborted",
   ]
 
   static func parse(_ data: Data) -> CodexLifecycleParseResult {
@@ -564,108 +573,81 @@ enum CodexLifecycleParser {
   }
 
   static func scan(_ data: Data) -> ScanResult {
-    var matches: [(offset: Int, marker: Marker, range: Range<Data.Index>)] = []
-    for marker in markers {
-      var searchStart = data.startIndex
-      while searchStart < data.endIndex,
-        let range = data.range(of: marker.bytes, in: searchStart..<data.endIndex)
-      {
-        matches.append((data.distance(from: data.startIndex, to: range.lowerBound), marker, range))
-        searchStart = range.upperBound
-      }
-    }
-    matches.sort { $0.offset < $1.offset }
-
-    var recognizedTokenOffsets = Set<Int>()
+    var events: [PositionedEvent] = []
     var malformedOffsets: [Int] = []
-    let parsedEvents = matches.compactMap { match -> PositionedEvent? in
-      let tokenOffset = match.offset + match.marker.bytes.count - match.marker.lifecycleToken.count
-      recognizedTokenOffsets.insert(tokenOffset)
-      switch parseMatch(marker: match.marker, range: match.range, in: data) {
+    var lineStart = data.startIndex
+
+    while lineStart < data.endIndex {
+      let lineEnd = data[lineStart...].firstIndex(of: 0x0A) ?? data.endIndex
+      let line = data[lineStart..<lineEnd]
+      let offset = data.distance(from: data.startIndex, to: lineStart)
+      switch parseLine(Data(line)) {
       case .event(let event):
-        return PositionedEvent(offset: match.offset, event: event)
+        events.append(PositionedEvent(offset: offset, event: event))
       case .malformedLifecycleEvent:
-        malformedOffsets.append(match.offset)
-        return nil
+        malformedOffsets.append(offset)
       case .irrelevant:
-        return nil
+        break
       }
+      guard lineEnd < data.endIndex else { break }
+      lineStart = data.index(after: lineEnd)
     }
 
-    for token in lifecycleTokens {
-      var searchStart = data.startIndex
-      while searchStart < data.endIndex,
-        let range = data.range(of: token, in: searchStart..<data.endIndex)
-      {
-        let offset = data.distance(from: data.startIndex, to: range.lowerBound)
-        if !recognizedTokenOffsets.contains(offset) {
-          malformedOffsets.append(offset)
-        }
-        searchStart = range.upperBound
-      }
-    }
-
-    return ScanResult(
-      events: parsedEvents,
-      malformedOffsets: malformedOffsets.sorted()
-    )
+    return ScanResult(events: events, malformedOffsets: malformedOffsets)
   }
 
   static func lastEvent(in data: Data) -> CodexLifecycleParseResult {
     parse(data)
   }
 
-  private static func parseMatch(
-    marker: Marker,
-    range: Range<Data.Index>,
-    in data: Data
-  ) -> CodexLifecycleParseResult {
-    let fieldWindowEnd = min(data.endIndex, range.upperBound + 1_024)
-    let fieldWindow = data[range.upperBound..<fieldWindowEnd]
-    let turnID = extractJSONString(named: "turn_id", from: fieldWindow)
-    let startedAtSeconds = extractNumber(named: "started_at", from: fieldWindow)
+  private static func parseLine(_ data: Data) -> CodexLifecycleParseResult {
+    let trimmed = data.drop(while: { $0 == 0x20 || $0 == 0x09 || $0 == 0x0D })
+    guard !trimmed.isEmpty else { return .irrelevant }
 
-    if marker.kind == .started, turnID == nil {
+    guard
+      let object = try? JSONSerialization.jsonObject(
+        with: Data(trimmed),
+        options: [.fragmentsAllowed]
+      ) as? [String: Any]
+    else {
+      let containsLifecycleType = lifecycleTypes.contains { data.contains(Data($0.utf8)) }
+      return containsLifecycleType ? .malformedLifecycleEvent : .irrelevant
+    }
+
+    let envelopeType = object["type"] as? String
+    let payload = object["payload"] as? [String: Any]
+    let lifecycleType = payload?["type"] as? String
+
+    guard let lifecycleType, lifecycleTypes.contains(lifecycleType) else {
+      return .irrelevant
+    }
+    guard envelopeType == "event_msg", let payload else {
       return .malformedLifecycleEvent
     }
+
+    let kind: CodexLifecycleEventKind =
+      lifecycleType == "task_started" || lifecycleType == "turn_started"
+      ? .started
+      : .completed
+    let turnID = payload["turn_id"] as? String
+    guard kind == .completed || turnID != nil else {
+      return .malformedLifecycleEvent
+    }
+
+    let startedAt: Date?
+    if let number = payload["started_at"] as? NSNumber {
+      startedAt = Date(timeIntervalSince1970: number.doubleValue)
+    } else if let string = payload["started_at"] as? String,
+      let seconds = TimeInterval(string)
+    {
+      startedAt = Date(timeIntervalSince1970: seconds)
+    } else {
+      startedAt = nil
+    }
+
     return .event(
-      CodexLifecycleEvent(
-        kind: marker.kind,
-        turnID: turnID,
-        startedAt: startedAtSeconds.map(Date.init(timeIntervalSince1970:))
-      )
+      CodexLifecycleEvent(kind: kind, turnID: turnID, startedAt: startedAt)
     )
-  }
-
-  private static func extractJSONString(
-    named name: String,
-    from data: Data.SubSequence
-  ) -> String? {
-    let prefix = Data("\"\(name)\":\"".utf8)
-    guard let prefixRange = data.range(of: prefix) else { return nil }
-    let valueStart = prefixRange.upperBound
-    guard let valueEnd = data[valueStart...].firstIndex(of: UInt8(ascii: "\"")) else {
-      return nil
-    }
-    return String(data: data[valueStart..<valueEnd], encoding: .utf8)
-  }
-
-  private static func extractNumber(
-    named name: String,
-    from data: Data.SubSequence
-  ) -> TimeInterval? {
-    let prefix = Data("\"\(name)\":".utf8)
-    guard let prefixRange = data.range(of: prefix) else { return nil }
-    var end = prefixRange.upperBound
-    while end < data.endIndex {
-      let byte = data[end]
-      guard (byte >= 48 && byte <= 57) || byte == 46 else { break }
-      end = data.index(after: end)
-    }
-    guard end > prefixRange.upperBound,
-      let value = String(data: data[prefixRange.upperBound..<end], encoding: .utf8)
-    else { return nil }
-    return TimeInterval(value)
   }
 }
 
@@ -756,6 +738,14 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     lastKnownRuntime = false
     hasObservedSession = false
     snapshot = .idle
+  }
+
+  func startMonitoring(onChange: @escaping @Sendable () -> Void) {
+    (locator as? CodexOpenSessionEventSource)?.startMonitoring(onChange: onChange)
+  }
+
+  func stopMonitoring() {
+    (locator as? CodexOpenSessionEventSource)?.stopMonitoring()
   }
 
   @discardableResult
@@ -914,18 +904,28 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     let handle = try FileHandle(forReadingFrom: url)
     defer { try? handle.close() }
     let prefix = try handle.read(upToCount: Self.sessionPrefixSize) ?? Data()
-    guard prefix.range(of: Data(#""type":"session_meta","payload":{"#.utf8)) != nil else {
-      return .unknown
-    }
-    if prefix.range(of: Data(#""thread_source":"subagent""#.utf8)) != nil
-      || prefix.range(of: Data(#""parent_thread_id":""#.utf8)) != nil
-    {
-      return .child
-    }
-    if prefix.range(of: Data(#""thread_source":"user""#.utf8)) != nil
-      || prefix.range(of: Data(#""parent_thread_id":null"#.utf8)) != nil
-    {
-      return .root
+    var lineStart = prefix.startIndex
+    while lineStart < prefix.endIndex {
+      let lineEnd = prefix[lineStart...].firstIndex(of: 0x0A) ?? prefix.endIndex
+      let line = prefix[lineStart..<lineEnd]
+      if let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+        object["type"] as? String == "session_meta",
+        let payload = object["payload"] as? [String: Any]
+      {
+        if payload["thread_source"] as? String == "subagent"
+          || payload["parent_thread_id"] as? String != nil
+        {
+          return .child
+        }
+        if payload["thread_source"] as? String == "user"
+          || payload["parent_thread_id"] is NSNull
+        {
+          return .root
+        }
+        return .unknown
+      }
+      guard lineEnd < prefix.endIndex else { break }
+      lineStart = prefix.index(after: lineEnd)
     }
     return .unknown
   }
