@@ -45,13 +45,21 @@ If **Open Anyway** is not visible, try opening the app from **Applications** aga
 
 Codex Not Sleep lives entirely in the menu bar. Use the native **Stay Awake** menu item to enable or disable automatic protection at any time. Setup and sleep-recovery actions appear only when needed.
 
+Ordinary open-lid protection uses macOS's native sleep assertion and does not
+require administrator approval. The optional **Use with Lid Closed…** menu item
+appears separately; it requests the one-time closed-lid setup only when you
+choose that feature.
+
 > Keeping a Mac awake with its lid closed can use more battery and generate heat. Do not leave an active Mac inside a bag or another enclosed space.
 
 ## Privacy and permissions
 
 Codex Not Sleep reads lifecycle markers from local Codex session files to determine when a task starts and finishes. It does not store or send your prompts, responses, or source code.
 
-Closed-lid operation requires a one-time administrator confirmation. The app installs a narrow `sudoers` rule that permits only the two required `pmset` commands. The historical filename is retained so existing installations can be recovered and removed. Remove that rule with:
+Closed-lid operation requires a one-time administrator confirmation. The app
+installs a narrow `sudoers` rule that permits only the two required `pmset`
+commands. The historical filename is retained so existing installations can be
+recovered and removed. Remove that rule with:
 
 ```bash
 sudo rm /private/etc/sudoers.d/methamphetamine_power_protect_$(id -u)
