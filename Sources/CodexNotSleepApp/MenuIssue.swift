@@ -7,7 +7,7 @@ enum MenuIssue: Equatable {
   var title: String {
     switch self {
     case .permissionRequired:
-      "Use with lid closed"
+      "Use with Lid Closed…"
     case .sleepRestoreRequired:
       "Fix sleep issue"
     }

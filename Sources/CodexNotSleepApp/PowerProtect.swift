@@ -1,6 +1,6 @@
+import CodexNotSleepCore
 import Darwin
 import Foundation
-import CodexNotSleepCore
 
 enum PowerProtectError: LocalizedError, Equatable {
   case setupCancelled
@@ -30,48 +30,22 @@ enum PowerProtectError: LocalizedError, Equatable {
   }
 }
 
-struct PowerProtectCommandResult: Sendable {
-  let status: Int32
-  let output: String
+enum PowerProtectSetupState: Equatable, Sendable {
+  case notInstalled
+  case installedAndValid
+  case installedButInvalid
+  case unavailable
 }
 
-protocol PowerProtectCommandRunning: Sendable {
-  func run(
-    executable: String,
-    arguments: [String],
-    environment: [String: String]?
-  ) throws -> PowerProtectCommandResult
+protocol ClosedLidProtectionManaging: AnyObject {
+  var isClosedLidEnabled: Bool { get }
+  func setClosedLidEnabled(_ enabled: Bool)
+  func prepareClosedLid() throws
 }
 
-extension PowerProtectCommandRunning {
-  func run(executable: String, arguments: [String]) throws -> PowerProtectCommandResult {
-    try run(executable: executable, arguments: arguments, environment: nil)
-  }
-}
-
-struct ProcessPowerProtectCommandRunner: PowerProtectCommandRunning {
-  func run(
-    executable: String,
-    arguments: [String],
-    environment: [String: String]?
-  ) throws -> PowerProtectCommandResult {
-    let process = Process()
-    let outputPipe = Pipe()
-    process.executableURL = URL(filePath: executable)
-    process.arguments = arguments
-    if let environment { process.environment = environment }
-    process.standardOutput = outputPipe
-    process.standardError = outputPipe
-
-    try process.run()
-    let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-    return PowerProtectCommandResult(
-      status: process.terminationStatus,
-      output: String(decoding: outputData, as: UTF8.self)
-    )
-  }
-}
+typealias PowerProtectCommandResult = BoundedProcessResult
+typealias PowerProtectCommandRunning = BoundedProcessRunning
+typealias ProcessPowerProtectCommandRunner = BoundedProcessRunner
 
 enum PowerProtectAuthorizationEnvironment {
   private static let removedNames: Set<String> = [
@@ -130,9 +104,24 @@ final class NSAppleScriptPowerProtectAuthorizationRunner: PowerProtectAuthorizat
 }
 
 protocol PowerProtectInstalling: AnyObject {
+  var setupState: PowerProtectSetupState { get }
   var hasRuleFile: Bool { get }
   var isInstalled: Bool { get }
   func install() throws
+}
+
+struct PowerProtectRuleFileState: Equatable, Sendable {
+  let exists: Bool
+  let isRegularFile: Bool
+  let ownerID: uid_t?
+  let permissions: UInt16?
+
+  static let notInstalled = PowerProtectRuleFileState(
+    exists: false,
+    isRegularFile: false,
+    ownerID: nil,
+    permissions: nil
+  )
 }
 
 final class PowerProtectInstaller: PowerProtectInstalling {
@@ -143,18 +132,24 @@ final class PowerProtectInstaller: PowerProtectInstalling {
     "do shell script \"/usr/bin/true\" with prompt \"\(authorizationPrompt)\" with administrator privileges"
   }
 
-  var hasRuleFile: Bool {
-    installationCheck()
+  var setupState: PowerProtectSetupState {
+    let fileState = fileStateProvider()
+    guard fileState.exists else { return .notInstalled }
+    guard
+      fileState.isRegularFile,
+      fileState.ownerID == 0,
+      fileState.permissions == 0o440
+    else { return .installedButInvalid }
+    return Self.verifyInstallation(using: runner) ? .installedAndValid : .installedButInvalid
   }
 
-  var isInstalled: Bool {
-    installationCheck() && Self.verifyInstallation(using: runner)
-  }
+  var hasRuleFile: Bool { fileStateProvider().exists }
+  var isInstalled: Bool { setupState == .installedAndValid }
   private let runner: any PowerProtectCommandRunning
   private let authorizationRunner: any PowerProtectAuthorizationRunning
   private let userID: uid_t
   private let sudoersPath: String
-  private let installationCheck: () -> Bool
+  private let fileStateProvider: () -> PowerProtectRuleFileState
 
   init(
     runner: any PowerProtectCommandRunning = ProcessPowerProtectCommandRunner(),
@@ -162,17 +157,43 @@ final class PowerProtectInstaller: PowerProtectInstalling {
       NSAppleScriptPowerProtectAuthorizationRunner(),
     userID: uid_t = getuid(),
     fileManager: FileManager = .default,
-    installationCheck: (() -> Bool)? = nil
+    installationCheck: (() -> Bool)? = nil,
+    fileStateProvider: (() -> PowerProtectRuleFileState)? = nil
   ) {
     self.runner = runner
     self.authorizationRunner = authorizationRunner
     self.userID = userID
     let sudoersPath = Self.sudoersPath(for: userID)
     self.sudoersPath = sudoersPath
-    let check = installationCheck ?? {
-      fileManager.fileExists(atPath: sudoersPath)
+    if let fileStateProvider {
+      self.fileStateProvider = fileStateProvider
+    } else if let installationCheck {
+      self.fileStateProvider = {
+        installationCheck()
+          ? PowerProtectRuleFileState(
+            exists: true,
+            isRegularFile: true,
+            ownerID: 0,
+            permissions: 0o440
+          )
+          : .notInstalled
+      }
+    } else {
+      self.fileStateProvider = {
+        guard
+          let attributes = try? fileManager.attributesOfItem(atPath: sudoersPath),
+          let type = attributes[.type] as? FileAttributeType,
+          let ownerID = attributes[.ownerAccountID] as? NSNumber,
+          let permissions = attributes[.posixPermissions] as? NSNumber
+        else { return .notInstalled }
+        return PowerProtectRuleFileState(
+          exists: true,
+          isRegularFile: type == .typeRegular,
+          ownerID: ownerID.uint32Value,
+          permissions: UInt16(truncating: permissions)
+        )
+      }
     }
-    self.installationCheck = check
   }
 
   func install() throws {
@@ -180,13 +201,13 @@ final class PowerProtectInstaller: PowerProtectInstalling {
 
     let result = authorizationRunner.run(script: administratorAppleScript)
 
-    guard result.status == 0 else {
+    guard result.succeeded else {
       if result.status == -128 {
         throw PowerProtectError.setupCancelled
       }
       throw PowerProtectError.setupFailed
     }
-    guard installationCheck() else {
+    guard fileStateProvider().exists else {
       throw PowerProtectError.setupVerificationFailed
     }
 
@@ -210,8 +231,14 @@ final class PowerProtectInstaller: PowerProtectInstalling {
   ) -> Bool {
     for arguments in verificationArgumentSets {
       guard
-        let result = try? runner.run(executable: "/usr/bin/sudo", arguments: arguments),
-        result.status == 0
+        let result = try? runner.run(
+          executable: "/usr/bin/sudo",
+          arguments: arguments,
+          environment: PowerProtectAuthorizationEnvironment.sanitized(
+            ProcessInfo.processInfo.environment
+          )
+        ),
+        result.succeeded
       else { return false }
     }
     return true
@@ -271,9 +298,12 @@ final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
 
     do {
       try process.run()
-      let readiness = readinessPipe.fileHandleForReading.readData(ofLength: 6)
+      let readiness = Self.readinessData(
+        from: readinessPipe.fileHandleForReading,
+        timeout: 2
+      )
       guard readiness == Data("ready\n".utf8), process.isRunning else {
-        if process.isRunning { process.terminate() }
+        BoundedProcessTermination.stop(process)
         throw PowerProtectError.watchdogFailed
       }
       self.process = process
@@ -284,8 +314,19 @@ final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
 
   func stop() {
     guard let process else { return }
-    if process.isRunning { process.terminate() }
+    BoundedProcessTermination.stop(process)
     self.process = nil
+  }
+
+  private static func readinessData(from handle: FileHandle, timeout: TimeInterval) -> Data? {
+    var descriptor = pollfd(
+      fd: handle.fileDescriptor,
+      events: Int16(POLLIN),
+      revents: 0
+    )
+    let milliseconds = Int32(min(max(timeout, 0.01) * 1_000, Double(Int32.max)))
+    guard Darwin.poll(&descriptor, 1, milliseconds) > 0 else { return nil }
+    return try? handle.read(upToCount: 6)
   }
 
   static let watchdogScript =
@@ -294,14 +335,37 @@ final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
     while /bin/kill -0 "$CNS_PARENT_PID" 2>/dev/null; do
       /bin/sleep 1
     done
+    run_bounded() {
+      directory=$(/usr/bin/mktemp -d "${CNS_LEASE_PATH}.watchdog.XXXXXX") || return 124
+      "$@" >"$directory/output" 2>/dev/null &
+      child=$!
+      ticks=0
+      while /bin/kill -0 "$child" 2>/dev/null; do
+        if [ "$ticks" -ge 20 ]; then
+          /bin/kill -TERM "$child" 2>/dev/null || true
+          /bin/sleep 0.1
+          /bin/kill -KILL "$child" 2>/dev/null || true
+          /bin/wait "$child" 2>/dev/null || true
+          /bin/rm -rf "$directory"
+          return 124
+        fi
+        /bin/sleep 0.1
+        ticks=$((ticks + 1))
+      done
+      /bin/wait "$child"
+      status=$?
+      /bin/cat "$directory/output"
+      /bin/rm -rf "$directory"
+      return "$status"
+    }
     while [ "$(/bin/cat "$CNS_LEASE_PATH" 2>/dev/null)" = "$CNS_LEASE_TOKEN" ]; do
-      current=$(/usr/bin/pmset -g 2>/dev/null | /usr/bin/awk '$1 == "SleepDisabled" { print $2; exit }')
+      current=$(run_bounded /usr/bin/pmset -g | /usr/bin/awk '$1 == "SleepDisabled" { print $2; exit }') || current=""
       if [ "$current" = "0" ]; then
         /bin/rm -f "$CNS_LEASE_PATH"
         exit 0
       fi
-      /usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1 || true
-      current=$(/usr/bin/pmset -g 2>/dev/null | /usr/bin/awk '$1 == "SleepDisabled" { print $2; exit }')
+      run_bounded /usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1 || true
+      current=$(run_bounded /usr/bin/pmset -g | /usr/bin/awk '$1 == "SleepDisabled" { print $2; exit }') || current=""
       if [ "$current" = "0" ]; then
         /bin/rm -f "$CNS_LEASE_PATH"
         exit 0
@@ -320,11 +384,14 @@ final class PowerProtectLeaseStore {
     if let url {
       self.url = url
     } else {
-      let applicationSupport = fileManager.urls(
-        for: .applicationSupportDirectory,
-        in: .userDomainMask
-      ).first ?? fileManager.homeDirectoryForCurrentUser.appending(path: "Library/Application Support")
-      self.url = applicationSupport
+      let applicationSupport =
+        fileManager.urls(
+          for: .applicationSupportDirectory,
+          in: .userDomainMask
+        ).first
+        ?? fileManager.homeDirectoryForCurrentUser.appending(path: "Library/Application Support")
+      self.url =
+        applicationSupport
         // Keep the legacy directory so an update can recover an old lease.
         .appending(path: "Methamphetamine", directoryHint: .isDirectory)
         .appending(path: "power-protect.lease")
@@ -350,11 +417,12 @@ final class PowerProtectLeaseStore {
   }
 }
 
-final class PMSetPowerProtectBackend: SleepProtectionBackend {
+final class PMSetPowerProtectBackend: SleepProtectionBackend, ClosedLidProtectionManaging {
   let identifier = "pmset closed-lid protection"
   private(set) var isHeld: Bool
+  private(set) var isClosedLidEnabled: Bool
 
-  // Checking the rule file is cheap and safe during app startup. Permission
+  // Presence is cheap and safe during app startup. Semantic permission
   // verification is deferred to the worker that performs acquire/release.
   var requiresSetup: Bool { !installer.hasRuleFile }
 
@@ -368,17 +436,27 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend {
     installer: (any PowerProtectInstalling)? = nil,
     runner: any PowerProtectCommandRunning = ProcessPowerProtectCommandRunner(),
     leaseStore: PowerProtectLeaseStore = PowerProtectLeaseStore(),
-    watchdog: any PowerProtectWatchdogControlling = ProcessPowerProtectWatchdog()
+    watchdog: any PowerProtectWatchdogControlling = ProcessPowerProtectWatchdog(),
+    closedLidEnabled: Bool = true
   ) {
     self.runner = runner
     self.leaseStore = leaseStore
     self.watchdog = watchdog
     self.installer = installer ?? PowerProtectInstaller(runner: runner)
     isHeld = leaseStore.hasLease
+    isClosedLidEnabled = closedLidEnabled
   }
 
   func prepare() throws {
+    try prepareClosedLid()
+  }
+
+  func prepareClosedLid() throws {
     try installer.install()
+  }
+
+  func setClosedLidEnabled(_ enabled: Bool) {
+    isClosedLidEnabled = enabled
   }
 
   func recover() throws {
@@ -483,16 +561,21 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend {
       executable: "/usr/bin/sudo",
       arguments: [
         "-n", "/usr/bin/pmset", "-a", "disablesleep", isDisabled ? "1" : "0",
-      ]
+      ],
+      environment: Self.sanitizedEnvironment
     )
-    guard result.status == 0 else {
+    guard result.succeeded else {
       throw isDisabled ? PowerProtectError.commandFailed : PowerProtectError.restoreFailed
     }
   }
 
   private func sleepIsDisabled() throws -> Bool {
-    let result = try runner.run(executable: "/usr/bin/pmset", arguments: ["-g"])
-    guard result.status == 0 else { throw PowerProtectError.stateVerificationFailed }
+    let result = try runner.run(
+      executable: "/usr/bin/pmset",
+      arguments: ["-g"],
+      environment: Self.sanitizedEnvironment
+    )
+    guard result.succeeded else { throw PowerProtectError.stateVerificationFailed }
     for line in result.output.split(separator: "\n") {
       let fields = line.split(whereSeparator: \.isWhitespace)
       if fields.first == "SleepDisabled", let value = fields.last {
@@ -501,26 +584,46 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend {
     }
     return false
   }
+
+  private static let sanitizedEnvironment =
+    PowerProtectAuthorizationEnvironment.sanitized(ProcessInfo.processInfo.environment)
 }
 
-final class CombinedSleepProtectionBackend: SleepProtectionBackend {
+final class CombinedSleepProtectionBackend: SleepProtectionBackend, ClosedLidProtectionManaging {
   let identifier = "IOPM + pmset closed-lid protection"
   var isHeld: Bool { idleSleep.isHeld || closedLid.isHeld }
-  var requiresSetup: Bool { closedLid.requiresSetup }
+  // Closed-lid support is optional. Ordinary IOPM protection never requires
+  // administrator setup and remains available when this component is absent.
+  var requiresSetup: Bool { false }
+  var isClosedLidEnabled: Bool {
+    (closedLid as? any ClosedLidProtectionManaging)?.isClosedLidEnabled ?? true
+  }
 
   private let idleSleep: any SleepProtectionBackend
   private let closedLid: any SleepProtectionBackend
 
   init(
     idleSleep: any SleepProtectionBackend,
-    closedLid: any SleepProtectionBackend
+    closedLid: any SleepProtectionBackend,
+    closedLidEnabled: Bool? = nil
   ) {
     self.idleSleep = idleSleep
     self.closedLid = closedLid
+    if let closedLidEnabled {
+      (closedLid as? any ClosedLidProtectionManaging)?.setClosedLidEnabled(closedLidEnabled)
+    }
   }
 
   func prepare() throws {
+    try prepareClosedLid()
+  }
+
+  func prepareClosedLid() throws {
     try closedLid.prepare()
+  }
+
+  func setClosedLidEnabled(_ enabled: Bool) {
+    (closedLid as? any ClosedLidProtectionManaging)?.setClosedLidEnabled(enabled)
   }
 
   func recover() throws {
@@ -530,6 +633,7 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend {
 
   func acquire() throws {
     try idleSleep.acquire()
+    guard isClosedLidEnabled else { return }
     do {
       try closedLid.acquire()
     } catch {
@@ -551,22 +655,26 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend {
       try idleSleep.renew()
     }
 
-    do {
-      if closedLid.isHeld {
-        try closedLid.renew()
-      } else {
-        try closedLid.acquire()
-      }
-    } catch {
-      let renewalError = error
-      if acquiredIdleSleep {
-        do {
-          try idleSleep.release()
-        } catch {
-          throw error
+    if isClosedLidEnabled {
+      do {
+        if closedLid.isHeld {
+          try closedLid.renew()
+        } else {
+          try closedLid.acquire()
         }
+      } catch {
+        let renewalError = error
+        if acquiredIdleSleep {
+          do {
+            try idleSleep.release()
+          } catch {
+            throw error
+          }
+        }
+        throw renewalError
       }
-      throw renewalError
+    } else if closedLid.isHeld {
+      try closedLid.release()
     }
   }
 

@@ -1,5 +1,6 @@
-import Foundation
 import CodexNotSleepCore
+import Foundation
+import IOKit.pwr_mgt
 import Testing
 
 @testable import CodexNotSleepApp
@@ -312,6 +313,107 @@ struct PowerProtectTests {
   }
 
   @Test
+  func ordinaryProtectionDoesNotRequireClosedLidSetup() throws {
+    let idle = PartialSleepProtectionBackend(isHeld: false)
+    let closedLid = TestClosedLidSleepBackend(enabled: false)
+    let backend = CombinedSleepProtectionBackend(
+      idleSleep: idle,
+      closedLid: closedLid,
+      closedLidEnabled: false
+    )
+
+    #expect(!backend.requiresSetup)
+    try backend.acquire()
+
+    #expect(idle.acquireCount == 1)
+    #expect(closedLid.acquireCount == 0)
+    #expect(backend.isHeld)
+  }
+
+  @Test
+  func invalidSudoersMetadataTakesTheRepairPath() throws {
+    let authorization = RecordingPowerProtectAuthorizationRunner(
+      result: PowerProtectCommandResult(status: 0, output: "")
+    )
+    let installer = PowerProtectInstaller(
+      runner: RecordingPowerProtectRunner(results: []),
+      authorizationRunner: authorization,
+      fileStateProvider: {
+        PowerProtectRuleFileState(
+          exists: true,
+          isRegularFile: true,
+          ownerID: 501,
+          permissions: 0o644
+        )
+      }
+    )
+
+    #expect(installer.setupState == .installedButInvalid)
+    do {
+      try installer.install()
+      Issue.record("Expected invalid setup verification to fail")
+    } catch let error as PowerProtectError {
+      #expect(error == .setupVerificationFailed)
+    }
+    #expect(authorization.scripts.count == 1)
+  }
+
+  @Test
+  func validMetadataWithWrongSudoRuleIsStillInvalidAndRepairable() throws {
+    let authorization = RecordingPowerProtectAuthorizationRunner(
+      result: PowerProtectCommandResult(status: 0, output: "")
+    )
+    let runner = RecordingPowerProtectRunner(results: [Self.commandFailed()])
+    let installer = PowerProtectInstaller(
+      runner: runner,
+      authorizationRunner: authorization,
+      fileStateProvider: {
+        PowerProtectRuleFileState(
+          exists: true,
+          isRegularFile: true,
+          ownerID: 0,
+          permissions: 0o440
+        )
+      }
+    )
+
+    #expect(installer.setupState == .installedButInvalid)
+    do {
+      try installer.install()
+      Issue.record("Expected wrong sudo rule verification to fail")
+    } catch let error as PowerProtectError {
+      #expect(error == .setupVerificationFailed)
+    }
+    #expect(authorization.scripts.count == 1)
+  }
+
+  @Test
+  func assertionReleaseFailureRetainsOwnershipForRetry() throws {
+    let manager = FakeIOPMAssertionManager()
+    let backend = IdleSleepAssertionBackend(assertionManager: manager)
+
+    try backend.acquire()
+    manager.releaseResult = kIOReturnError
+    do {
+      try backend.release()
+      Issue.record("Expected assertion release to fail")
+    } catch let error as BackendError {
+      if case .assertionReleaseFailed(let code) = error {
+        #expect(code == kIOReturnError)
+      } else {
+        Issue.record("Unexpected backend error: \(error)")
+      }
+    }
+
+    #expect(backend.isHeld)
+    #expect(manager.lastReleasedID == manager.createdID)
+
+    manager.releaseResult = kIOReturnSuccess
+    try backend.release()
+    #expect(!backend.isHeld)
+  }
+
+  @Test
   func watchdogShellScriptHasValidSyntaxAndRetriesCleanup() throws {
     let runner = ProcessPowerProtectCommandRunner()
     let result = try runner.run(
@@ -451,8 +553,65 @@ private final class PartialSleepProtectionBackend: SleepProtectionBackend {
   }
 }
 
+private final class TestClosedLidSleepBackend:
+  SleepProtectionBackend, ClosedLidProtectionManaging
+{
+  let identifier = "closed-lid-test"
+  private(set) var isHeld = false
+  private(set) var acquireCount = 0
+  private(set) var isClosedLidEnabled: Bool
+
+  init(enabled: Bool) {
+    isClosedLidEnabled = enabled
+  }
+
+  var requiresSetup: Bool { true }
+
+  func prepare() throws {}
+
+  func prepareClosedLid() throws {}
+
+  func setClosedLidEnabled(_ enabled: Bool) {
+    isClosedLidEnabled = enabled
+  }
+
+  func acquire() throws {
+    acquireCount += 1
+    isHeld = true
+  }
+
+  func renew() throws {}
+
+  func release() {
+    isHeld = false
+  }
+}
+
+private final class FakeIOPMAssertionManager: IOPMAssertionManaging {
+  private(set) var createdID: IOPMAssertionID = 77
+  private(set) var lastReleasedID: IOPMAssertionID?
+  var createResult: IOReturn = kIOReturnSuccess
+  var releaseResult: IOReturn = kIOReturnSuccess
+
+  func createPreventUserIdleSystemSleep(
+    name _: String,
+    assertionID: UnsafeMutablePointer<IOPMAssertionID>
+  ) -> IOReturn {
+    assertionID.pointee = createdID
+    return createResult
+  }
+
+  func release(_ assertionID: IOPMAssertionID) -> IOReturn {
+    lastReleasedID = assertionID
+    return releaseResult
+  }
+}
+
 private final class FakePowerProtectInstaller: PowerProtectInstalling {
   var isInstalled: Bool
+  var setupState: PowerProtectSetupState {
+    isInstalled ? .installedAndValid : .notInstalled
+  }
   var hasRuleFile: Bool { isInstalled }
 
   init(isInstalled: Bool) {

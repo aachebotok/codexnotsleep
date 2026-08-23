@@ -12,10 +12,97 @@ struct BatteryStatus: Equatable, Sendable {
 
 protocol BatteryStatusProviding: Sendable {
   func currentStatus() -> BatteryStatus?
+  func startMonitoring(onChange: @escaping @Sendable () -> Void)
+  func stopMonitoring()
 }
 
-struct IOKitBatteryStatusProvider: BatteryStatusProviding {
+extension BatteryStatusProviding {
+  func startMonitoring(onChange: @escaping @Sendable () -> Void) {}
+  func stopMonitoring() {}
+}
+
+final class IOKitBatteryStatusProvider: BatteryStatusProviding, @unchecked Sendable {
+  private let readStatus: @Sendable () -> BatteryStatus?
+  private let lock = NSLock()
+  private var cachedStatus: BatteryStatus?
+  private var cacheIsValid = false
+  private var notificationSource: CFRunLoopSource?
+  private var changeHandler: (@Sendable () -> Void)?
+
+  init(
+    readStatus: @escaping @Sendable () -> BatteryStatus? = IOKitBatteryStatusProvider
+      .readCurrentStatus
+  ) {
+    self.readStatus = readStatus
+  }
+
   func currentStatus() -> BatteryStatus? {
+    let cached = lock.withLock { (cacheIsValid, cachedStatus) }
+    if cached.0 {
+      return cached.1
+    }
+
+    let status = readStatus()
+    lock.withLock {
+      cachedStatus = status
+      cacheIsValid = true
+    }
+    return status
+  }
+
+  func startMonitoring(onChange: @escaping @Sendable () -> Void) {
+    let shouldInstall = lock.withLock { () -> Bool in
+      changeHandler = onChange
+      return notificationSource == nil
+    }
+    guard shouldInstall else { return }
+
+    guard
+      let unmanagedSource = IOPSNotificationCreateRunLoopSource(
+        Self.notificationCallback,
+        Unmanaged.passUnretained(self).toOpaque()
+      )
+    else {
+      return
+    }
+    let source = unmanagedSource.takeRetainedValue()
+    lock.withLock { notificationSource = source }
+    CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+  }
+
+  func stopMonitoring() {
+    let source = lock.withLock { () -> CFRunLoopSource? in
+      changeHandler = nil
+      let source = notificationSource
+      notificationSource = nil
+      return source
+    }
+    if let source {
+      CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+    }
+  }
+
+  func invalidateCacheForTesting() {
+    handlePowerSourceChange()
+  }
+
+  private func handlePowerSourceChange() {
+    let handler = lock.withLock { () -> (@Sendable () -> Void)? in
+      cacheIsValid = false
+      return changeHandler
+    }
+    handler?()
+  }
+
+  private static let notificationCallback: IOPowerSourceCallbackType = { context in
+    guard let context else { return }
+    let provider = Unmanaged<IOKitBatteryStatusProvider>
+      .fromOpaque(context)
+      .takeUnretainedValue()
+    provider.handlePowerSourceChange()
+  }
+
+  private static func readCurrentStatus() -> BatteryStatus? {
     guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else {
       return nil
     }
@@ -35,7 +122,7 @@ struct IOKitBatteryStatusProvider: BatteryStatusProviding {
       guard
         let description = IOPSGetPowerSourceDescription(snapshot, powerSource)?
           .takeUnretainedValue() as? [String: Any],
-        let status = Self.status(
+        let status = status(
           from: description,
           isRunningOnBattery: isRunningOnBattery
         )

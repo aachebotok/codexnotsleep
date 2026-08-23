@@ -1,5 +1,5 @@
-import Foundation
 import CodexNotSleepCore
+import Foundation
 
 /// Runs blocking power-management work on a dedicated serial queue.
 // The queue is the sole owner of backend calls and ordering. This narrow
@@ -26,6 +26,31 @@ final class SleepProtectionWorker: @unchecked Sendable {
     completion: @escaping @MainActor @Sendable (Result<Void, Error>) -> Void
   ) {
     submit({ try $0.prepare() }, completion: completion)
+  }
+
+  func prepareClosedLid(
+    completion: @escaping @MainActor @Sendable (Result<Void, Error>) -> Void
+  ) {
+    submit(
+      { backend in
+        guard let manager = backend as? any ClosedLidProtectionManaging else {
+          return
+        }
+        try manager.prepareClosedLid()
+      }, completion: completion)
+  }
+
+  func setClosedLidEnabled(
+    _ enabled: Bool,
+    completion: @escaping @MainActor @Sendable (Result<Void, Error>) -> Void
+  ) {
+    submit(
+      { backend in
+        guard let manager = backend as? any ClosedLidProtectionManaging else {
+          return
+        }
+        manager.setClosedLidEnabled(enabled)
+      }, completion: completion)
   }
 
   func acquire(

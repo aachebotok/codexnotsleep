@@ -67,4 +67,42 @@ struct BatteryStatusProviderTests {
       ) == nil
     )
   }
+
+  @Test
+  func cachesStatusUntilPowerSourceChangeInvalidatesIt() {
+    let first = BatteryStatus(chargePercent: 80, isRunningOnBattery: false)
+    let second = BatteryStatus(chargePercent: 9, isRunningOnBattery: true)
+    let fixture = BatteryReadFixture(status: first)
+    let provider = IOKitBatteryStatusProvider(readStatus: fixture.read)
+
+    #expect(provider.currentStatus() == first)
+    fixture.status = second
+    #expect(provider.currentStatus() == first)
+    #expect(fixture.readCount == 1)
+
+    provider.invalidateCacheForTesting()
+    #expect(provider.currentStatus() == second)
+    #expect(fixture.readCount == 2)
+  }
+}
+
+private final class BatteryReadFixture: @unchecked Sendable {
+  private let lock = NSLock()
+  var status: BatteryStatus {
+    get { lock.withLock { storedStatus } }
+    set { lock.withLock { storedStatus = newValue } }
+  }
+  private var storedStatus: BatteryStatus
+  private(set) var readCount = 0
+
+  init(status: BatteryStatus) {
+    storedStatus = status
+  }
+
+  func read() -> BatteryStatus? {
+    lock.withLock {
+      readCount += 1
+      return storedStatus
+    }
+  }
 }

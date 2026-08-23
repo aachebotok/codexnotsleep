@@ -3,6 +3,7 @@ import Foundation
 @MainActor
 final class ProtectionPreferenceStore {
   nonisolated static let key = "agentSleepProtectionEnabled"
+  nonisolated static let closedLidKey = "closedLidProtectionEnabled"
   nonisolated static let pendingPowerProtectKey = "pendingPowerProtectEnable"
   // Retained only to migrate the old per-agent preference to the global toggle.
   nonisolated static let legacySelectionKey = "enabledCodingAgentIDs"
@@ -29,6 +30,14 @@ final class ProtectionPreferenceStore {
 
   func save(_ isEnabled: Bool) {
     defaults.set(isEnabled, forKey: Self.key)
+  }
+
+  func loadClosedLidEnabled() -> Bool {
+    defaults.bool(forKey: Self.closedLidKey)
+  }
+
+  func saveClosedLidEnabled(_ isEnabled: Bool) {
+    defaults.set(isEnabled, forKey: Self.closedLidKey)
   }
 
   var isPowerProtectSetupPending: Bool {

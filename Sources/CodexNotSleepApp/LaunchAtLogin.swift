@@ -108,14 +108,39 @@ final class LaunchAtLoginController: LaunchAtLoginControlling {
   }
 
   nonisolated private static func canRegisterCurrentApp() -> Bool {
-    let bundleURL = Bundle.main.bundleURL
+    isEligibleAppURL(Bundle.main.bundleURL)
+  }
+
+  nonisolated static func isEligibleAppURL(
+    _ bundleURL: URL,
+    homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+  ) -> Bool {
+    let bundleURL = bundleURL.standardizedFileURL.resolvingSymlinksInPath()
     guard bundleURL.pathExtension == "app" else { return false }
 
     guard
       let values = try? bundleURL.resourceValues(forKeys: [.volumeIsReadOnlyKey]),
       let isReadOnly = values.volumeIsReadOnly
     else { return false }
-    return !isReadOnly
+    guard !isReadOnly else { return false }
+
+    return isEligibleAppPath(bundleURL, homeDirectory: homeDirectory)
+  }
+
+  nonisolated static func isEligibleAppPath(
+    _ bundleURL: URL,
+    homeDirectory: URL
+  ) -> Bool {
+    let bundleURL = bundleURL.standardizedFileURL
+    guard bundleURL.pathExtension == "app" else { return false }
+    let allowedRoots = [
+      URL(filePath: "/Applications").standardizedFileURL,
+      homeDirectory.appending(path: "Applications").standardizedFileURL,
+    ]
+    return allowedRoots.contains { root in
+      let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+      return bundleURL.path.hasPrefix(rootPath)
+    }
   }
 }
 

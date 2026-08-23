@@ -1,5 +1,5 @@
-import Foundation
 import CodexNotSleepCore
+import Foundation
 import Testing
 
 @testable import CodexNotSleepApp
@@ -7,6 +7,18 @@ import Testing
 @Suite
 @MainActor
 struct LidBrightnessControllerTests {
+  @Test
+  func lidSensorStateMachineKeepsManagerReadyAfterDeviceRemoval() {
+    var machine = LidSensorConnectionStateMachine()
+    machine.managerOpened()
+    machine.deviceAttached()
+    machine.deviceDetached()
+    #expect(machine.state == .managerReady)
+    machine.deviceAttached()
+    machine.stopped()
+    #expect(machine.state == .stopped)
+  }
+
   @Test
   func brightnessCurveUsesOnePercentAtClosedAndOriginalAtFortyFiveDegrees() {
     let original = 0.72
@@ -246,6 +258,33 @@ struct LidBrightnessControllerTests {
   }
 
   @Test
+  func failedRestoreRetainsOwnershipForLaterLifecycleRetry() {
+    let sensor = TestLidAngleSensor(angle: 25)
+    let display = TestDisplayBrightnessProvider(brightness: 0.8)
+    let controller = LidBrightnessController(
+      angleSensor: sensor,
+      displayProvider: display,
+      schedulesTimer: false
+    )
+
+    controller.setCodexWorking(true)
+    let start = Date()
+    controller.refreshBrightness(at: start)
+    controller.refreshBrightness(
+      at: start.addingTimeInterval(LidBrightnessController.transitionDuration)
+    )
+    #expect((display.writes.last?.brightness ?? 1) < 0.8)
+
+    display.failNextWrite = true
+    controller.setCodexWorking(false)
+    #expect(display.writes.last?.brightness != 0.8)
+
+    controller.setCodexWorking(true)
+    controller.setCodexWorking(false)
+    #expect(display.writes.last?.brightness == 0.8)
+  }
+
+  @Test
   func controllerDimsOnlyForConfirmedActiveCodexWork() {
     let suiteName = "CodexNotSleep.LidBrightnessTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!
@@ -254,12 +293,8 @@ struct LidBrightnessControllerTests {
 
     let activity = LidBrightnessTestActivity(snapshot: .unavailable(protectConservatively: true))
     let brightness = RecordingLidBrightnessController()
-    let fixtureHome = FileManager.default.temporaryDirectory.appending(
-      path: "CodexNotSleep.LidBrightnessTests.\(UUID().uuidString)"
-    )
     let controller = AppController(
       defaults: defaults,
-      legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
       backend: LidBrightnessTestBackend(),
       codexActivityProvider: activity,
       protectionGraceSeconds: 0,
@@ -331,7 +366,7 @@ private final class TestDisplayBrightnessProvider: DisplayBrightnessProviding {
 
 @MainActor
 private final class TestKeyboardBacklightProvider: KeyboardBacklightProviding {
-  let keyboardID: UInt64 = 95158272
+  let keyboardID: UInt64 = 95_158_272
   private(set) var brightness: Double
   private(set) var writes: [Double] = []
 

@@ -1,5 +1,5 @@
-import Foundation
 import CodexNotSleepCore
+import Foundation
 import Testing
 
 @testable import CodexNotSleepApp
@@ -73,6 +73,36 @@ struct LaunchAtLoginControllerTests {
   }
 
   @Test
+  func pathEligibilityOnlyAllowsApplicationsDirectories() {
+    let home = URL(filePath: "/Users/tester")
+    #expect(
+      LaunchAtLoginController.isEligibleAppPath(
+        URL(filePath: "/Applications/Codex Not Sleep.app"),
+        homeDirectory: home
+      ))
+    #expect(
+      LaunchAtLoginController.isEligibleAppPath(
+        URL(filePath: "/Users/tester/Applications/Codex Not Sleep.app"),
+        homeDirectory: home
+      ))
+    #expect(
+      !LaunchAtLoginController.isEligibleAppPath(
+        URL(filePath: "/Users/tester/Documents/cns/dist/Codex Not Sleep.app"),
+        homeDirectory: home
+      ))
+    #expect(
+      !LaunchAtLoginController.isEligibleAppPath(
+        URL(filePath: "/Users/tester/Downloads/Codex Not Sleep.app"),
+        homeDirectory: home
+      ))
+    #expect(
+      !LaunchAtLoginController.isEligibleAppPath(
+        URL(filePath: "/Volumes/Codex Not Sleep/Codex Not Sleep.app"),
+        homeDirectory: home
+      ))
+  }
+
+  @Test
   func reportsRegistrationFailure() {
     let service = FakeLaunchAtLoginService(
       status: .notRegistered,
@@ -109,13 +139,8 @@ struct LaunchAtLoginControllerTests {
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let launchAtLogin = RecordingLaunchAtLoginController()
-    let fixtureHome = FileManager.default.temporaryDirectory.appending(
-      path: "CodexNotSleep.LaunchAtLoginTests.\(UUID().uuidString)",
-      directoryHint: .isDirectory
-    )
     let controller = AppController(
       defaults: defaults,
-      legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome),
       backend: LaunchAtLoginTestSleepProtectionBackend(),
       launchAtLoginController: launchAtLogin,
       startsAutomatically: false

@@ -18,6 +18,32 @@ extension LidAngleProviding {
   func stopMonitoring() {}
 }
 
+enum LidSensorConnectionState: Equatable, Sendable {
+  case stopped
+  case managerReady
+  case deviceReady
+}
+
+struct LidSensorConnectionStateMachine: Equatable, Sendable {
+  private(set) var state: LidSensorConnectionState = .stopped
+
+  mutating func managerOpened() {
+    state = .managerReady
+  }
+
+  mutating func deviceAttached() {
+    state = .deviceReady
+  }
+
+  mutating func deviceDetached() {
+    state = .managerReady
+  }
+
+  mutating func stopped() {
+    state = .stopped
+  }
+}
+
 @MainActor
 final class IOKitLidAngleSensor: LidAngleProviding {
   static let vendorID = 0x05AC
@@ -33,16 +59,19 @@ final class IOKitLidAngleSensor: LidAngleProviding {
   private var angleElement: IOHIDElement?
   private var angleHandler: ((Double) -> Void)?
   private var callbackQueue: DispatchQueue?
+  private var connectionStateMachine = LidSensorConnectionStateMachine()
+
+  var connectionState: LidSensorConnectionState { connectionStateMachine.state }
 
   func currentAngle() -> Double? {
     guard ensureDevice() else { return nil }
     guard let device, let angleElement else {
-      disconnect()
+      detachDevice()
       return nil
     }
 
     guard let rawAngle = Self.readAngle(device: device, element: angleElement) else {
-      disconnect()
+      detachDevice()
       return nil
     }
 
@@ -54,7 +83,8 @@ final class IOKitLidAngleSensor: LidAngleProviding {
 
   func startMonitoring(onChange: @escaping (Double) -> Void) {
     angleHandler = onChange
-    guard ensureDevice() else { return }
+    _ = ensureManager()
+    _ = attachMatchingDevice()
     if let angle = currentAngle() {
       onChange(angle)
     }
@@ -62,17 +92,17 @@ final class IOKitLidAngleSensor: LidAngleProviding {
 
   func stopMonitoring() {
     angleHandler = nil
-    disconnect()
+    stopManager()
   }
 
   private func ensureDevice() -> Bool {
     if device != nil { return true }
-    return connect()
+    _ = ensureManager()
+    return attachMatchingDevice()
   }
 
-  private func connect() -> Bool {
-    disconnect()
-
+  private func ensureManager() -> Bool {
+    guard manager == nil else { return true }
     let manager = IOHIDManagerCreate(
       kCFAllocatorDefault,
       IOOptionBits(kIOHIDOptionsTypeNone)
@@ -111,12 +141,18 @@ final class IOKitLidAngleSensor: LidAngleProviding {
 
     guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess
     else {
-      disconnect()
+      self.manager = nil
+      self.callbackQueue = nil
       return false
     }
+    connectionStateMachine.managerOpened()
+    return true
+  }
 
+  private func attachMatchingDevice() -> Bool {
+    if device != nil { return true }
+    guard let manager else { return false }
     guard let devices = IOHIDManagerCopyDevices(manager) else {
-      disconnect()
       return false
     }
 
@@ -131,7 +167,7 @@ final class IOKitLidAngleSensor: LidAngleProviding {
 
       self.device = device
       guard let angleElement = Self.findAngleElement(on: device),
-            Self.readAngle(device: device, element: angleElement) != nil
+        Self.readAngle(device: device, element: angleElement) != nil
       else {
         IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
         self.device = nil
@@ -139,19 +175,21 @@ final class IOKitLidAngleSensor: LidAngleProviding {
       }
 
       self.angleElement = angleElement
+      connectionStateMachine.deviceAttached()
       return true
     }
 
-    disconnect()
     return false
   }
 
   private static func findAngleElement(on device: IOHIDDevice) -> IOHIDElement? {
-    guard let elements = IOHIDDeviceCopyMatchingElements(
-      device,
-      nil,
-      IOOptionBits(kIOHIDOptionsTypeNone)
-    ) else {
+    guard
+      let elements = IOHIDDeviceCopyMatchingElements(
+        device,
+        nil,
+        IOOptionBits(kIOHIDOptionsTypeNone)
+      )
+    else {
       return nil
     }
 
@@ -160,9 +198,9 @@ final class IOKitLidAngleSensor: LidAngleProviding {
       guard let rawElement = CFArrayGetValueAtIndex(elements, index) else { continue }
       let element = Unmanaged<IOHIDElement>.fromOpaque(rawElement).takeUnretainedValue()
       guard IOHIDElementGetUsagePage(element) == Self.usagePage,
-            IOHIDElementGetUsage(element) == Self.angleUsage,
-            IOHIDElementGetType(element) == kIOHIDElementTypeInput_Axis ||
-              IOHIDElementGetType(element) == kIOHIDElementTypeInput_Misc
+        IOHIDElementGetUsage(element) == Self.angleUsage,
+        IOHIDElementGetType(element) == kIOHIDElementTypeInput_Axis
+          || IOHIDElementGetType(element) == kIOHIDElementTypeInput_Misc
       else { continue }
       return element
     }
@@ -181,17 +219,25 @@ final class IOKitLidAngleSensor: LidAngleProviding {
     return Int64(IOHIDValueGetIntegerValue(valuePointer.pointee.takeUnretainedValue()))
   }
 
-  private func disconnect() {
-    callbackQueue = nil
+  private func detachDevice() {
     angleElement = nil
     if let device {
       IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
       self.device = nil
     }
+    if manager != nil {
+      connectionStateMachine.deviceDetached()
+    }
+  }
+
+  private func stopManager() {
+    detachDevice()
     if let manager {
       IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
       self.manager = nil
     }
+    callbackQueue = nil
+    connectionStateMachine.stopped()
   }
 
   private func handleInputValue(_ value: IOHIDValue) {
@@ -201,7 +247,8 @@ final class IOKitLidAngleSensor: LidAngleProviding {
     else { return }
 
     let rawAngle = IOHIDValueGetIntegerValue(value)
-    let angle = rawAngle <= 1
+    let angle =
+      rawAngle <= 1
       ? 0.0
       : min(Double(rawAngle), LidBrightnessCurve.sensorMaximumAngle)
     Task { @MainActor [weak self] in
@@ -212,7 +259,7 @@ final class IOKitLidAngleSensor: LidAngleProviding {
   private func handleDeviceMatching() {
     Task { @MainActor [weak self] in
       guard let self, self.angleHandler != nil, self.device == nil else { return }
-      guard ensureDevice(), let angle = currentAngle() else { return }
+      guard attachMatchingDevice(), let angle = currentAngle() else { return }
       angleHandler?(angle)
     }
   }
@@ -220,7 +267,7 @@ final class IOKitLidAngleSensor: LidAngleProviding {
   private func handleDeviceRemoval() {
     Task { @MainActor [weak self] in
       guard let self, self.angleHandler != nil else { return }
-      disconnect()
+      detachDevice()
     }
   }
 
@@ -278,7 +325,7 @@ enum LidBrightnessCurve {
     let closedBrightness = min(original, minimumBrightness)
     return closedBrightness
       + (original - closedBrightness)
-        * openFraction(for: angle, openAngle: openAngle)
+      * openFraction(for: angle, openAngle: openAngle)
   }
 
   static func targetKeyboardBrightness(
@@ -316,24 +363,27 @@ final class NoOpKeyboardBacklightProvider: KeyboardBacklightProviding {
 
 @MainActor
 final class SystemKeyboardBacklightProvider: KeyboardBacklightProviding {
-  private typealias BrightnessFunction = @convention(c) (
-    AnyObject,
-    Selector,
-    UInt64
-  ) -> Float
-  private typealias IsBuiltInFunction = @convention(c) (
-    AnyObject,
-    Selector,
-    UInt64
-  ) -> Bool
-  private typealias SetBrightnessFunction = @convention(c) (
-    AnyObject,
-    Selector,
-    Float,
-    Int32,
-    Bool,
-    UInt64
-  ) -> Bool
+  private typealias BrightnessFunction =
+    @convention(c) (
+      AnyObject,
+      Selector,
+      UInt64
+    ) -> Float
+  private typealias IsBuiltInFunction =
+    @convention(c) (
+      AnyObject,
+      Selector,
+      UInt64
+    ) -> Bool
+  private typealias SetBrightnessFunction =
+    @convention(c) (
+      AnyObject,
+      Selector,
+      Float,
+      Int32,
+      Bool,
+      UInt64
+    ) -> Bool
 
   private static let fadeMilliseconds: Int32 = 100
 
@@ -346,7 +396,7 @@ final class SystemKeyboardBacklightProvider: KeyboardBacklightProviding {
       RTLD_LAZY
     )
     if frameworkHandle != nil,
-       let clientType = NSClassFromString("KeyboardBrightnessClient") as? NSObject.Type
+      let clientType = NSClassFromString("KeyboardBrightnessClient") as? NSObject.Type
     {
       client = clientType.init()
     } else {
@@ -356,14 +406,14 @@ final class SystemKeyboardBacklightProvider: KeyboardBacklightProviding {
 
   func currentBuiltInKeyboard() -> ManagedKeyboardBacklight? {
     guard let client,
-          let ids = client.perform(NSSelectorFromString("copyKeyboardBacklightIDs"))?
-            .takeRetainedValue() as? [NSNumber]
+      let ids = client.perform(NSSelectorFromString("copyKeyboardBacklightIDs"))?
+        .takeRetainedValue() as? [NSNumber]
     else { return nil }
 
     let isBuiltInSelector = NSSelectorFromString("isKeyboardBuiltIn:")
     let brightnessSelector = NSSelectorFromString("brightnessForKeyboard:")
     guard client.responds(to: isBuiltInSelector),
-          client.responds(to: brightnessSelector)
+      client.responds(to: brightnessSelector)
     else { return nil }
 
     let isBuiltIn = unsafeBitCast(
@@ -420,14 +470,16 @@ protocol DisplayBrightnessProviding: AnyObject {
 
 @MainActor
 final class SystemDisplayBrightnessProvider: DisplayBrightnessProviding {
-  private typealias GetBrightnessFunction = @convention(c) (
-    CGDirectDisplayID,
-    UnsafeMutablePointer<Float>
-  ) -> Int32
-  private typealias SetBrightnessFunction = @convention(c) (
-    CGDirectDisplayID,
-    Float
-  ) -> Int32
+  private typealias GetBrightnessFunction =
+    @convention(c) (
+      CGDirectDisplayID,
+      UnsafeMutablePointer<Float>
+    ) -> Int32
+  private typealias SetBrightnessFunction =
+    @convention(c) (
+      CGDirectDisplayID,
+      Float
+    ) -> Int32
 
   private let displayServicesHandle: UnsafeMutableRawPointer?
   private let getDisplayServicesBrightness: GetBrightnessFunction?
@@ -477,7 +529,7 @@ final class SystemDisplayBrightnessProvider: DisplayBrightnessProviding {
     if CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 {
       var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
       if CGGetOnlineDisplayList(count, &displays, &count) == .success,
-         let builtIn = displays.prefix(Int(count)).first(where: { CGDisplayIsBuiltin($0) == 1 })
+        let builtIn = displays.prefix(Int(count)).first(where: { CGDisplayIsBuiltin($0) == 1 })
       {
         return UInt32(builtIn)
       }
@@ -646,14 +698,34 @@ final class LidBrightnessController: LidBrightnessControlling {
   }
 
   private func restoreBrightness(stopping: Bool = true) {
-    for (id, state) in displayStates where abs(state.current - state.original) > 0.0005 {
-      _ = displayProvider.setBrightness(state.original, for: id)
+    var displayRestored = Set<UInt32>()
+    for (id, state) in displayStates {
+      guard abs(state.current - state.original) > 0.0005 else {
+        displayRestored.insert(id)
+        continue
+      }
+      if displayProvider.setBrightness(state.original, for: id) {
+        displayRestored.insert(id)
+      }
     }
-    for (id, state) in keyboardStates where abs(state.current - state.original) > 0.0005 {
-      _ = keyboardProvider.setBrightness(state.original, for: id)
+    for id in displayRestored {
+      displayStates.removeValue(forKey: id)
     }
-    displayStates.removeAll()
-    keyboardStates.removeAll()
+
+    var keyboardRestored = Set<UInt64>()
+    for (id, state) in keyboardStates {
+      guard abs(state.current - state.original) > 0.0005 else {
+        keyboardRestored.insert(id)
+        continue
+      }
+      if keyboardProvider.setBrightness(state.original, for: id) {
+        keyboardRestored.insert(id)
+      }
+    }
+    for id in keyboardRestored {
+      keyboardStates.removeValue(forKey: id)
+    }
+
     timer?.invalidate()
     timer = nil
     if stopping {
@@ -706,16 +778,18 @@ final class LidBrightnessController: LidBrightnessControlling {
     var writeFailed = false
     for id in displayStates.keys {
       guard var state = displayStates[id],
-            let transitionStartedAt = state.transitionStartedAt
+        let transitionStartedAt = state.transitionStartedAt
       else { continue }
 
       let elapsed = date.timeIntervalSince(transitionStartedAt)
       let isComplete = elapsed >= Self.transitionDuration - Self.transitionCompletionTolerance
-      let progress = isComplete
+      let progress =
+        isComplete
         ? 1
         : min(max(elapsed / Self.transitionDuration, 0), 1)
       let easedProgress = LidBrightnessCurve.smoothProgress(progress)
-      let value = state.transitionFrom
+      let value =
+        state.transitionFrom
         + (state.target - state.transitionFrom) * easedProgress
       if abs(value - state.current) > 0.0005 {
         guard displayProvider.setBrightness(value, for: id) else {
@@ -739,16 +813,18 @@ final class LidBrightnessController: LidBrightnessControlling {
 
     for id in keyboardStates.keys {
       guard var state = keyboardStates[id],
-            let transitionStartedAt = state.transitionStartedAt
+        let transitionStartedAt = state.transitionStartedAt
       else { continue }
 
       let elapsed = date.timeIntervalSince(transitionStartedAt)
       let isComplete = elapsed >= Self.transitionDuration - Self.transitionCompletionTolerance
-      let progress = isComplete
+      let progress =
+        isComplete
         ? 1
         : min(max(elapsed / Self.transitionDuration, 0), 1)
       let easedProgress = LidBrightnessCurve.smoothProgress(progress)
-      let value = state.transitionFrom
+      let value =
+        state.transitionFrom
         + (state.target - state.transitionFrom) * easedProgress
       if abs(value - state.current) > 0.0005 {
         guard keyboardProvider.setBrightness(value, for: id) else {
@@ -770,7 +846,8 @@ final class LidBrightnessController: LidBrightnessControlling {
       return
     }
 
-    let hasActiveTransition = displayStates.values.contains { $0.transitionStartedAt != nil }
+    let hasActiveTransition =
+      displayStates.values.contains { $0.transitionStartedAt != nil }
       || keyboardStates.values.contains { $0.transitionStartedAt != nil }
     if !hasActiveTransition {
       timer?.invalidate()

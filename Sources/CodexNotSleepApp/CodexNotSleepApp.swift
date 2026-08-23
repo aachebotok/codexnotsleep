@@ -10,6 +10,11 @@ final class CodexNotSleepMenuBarController: NSObject, NSMenuDelegate {
     action: #selector(toggleProtection(_:)),
     keyEquivalent: ""
   )
+  private let closedLidItem = NSMenuItem(
+    title: "",
+    action: #selector(toggleClosedLid(_:)),
+    keyEquivalent: ""
+  )
   private let issueItem = NSMenuItem(
     title: "",
     action: #selector(resolveIssue(_:)),
@@ -17,7 +22,7 @@ final class CodexNotSleepMenuBarController: NSObject, NSMenuDelegate {
   )
   private let issueSeparator = NSMenuItem.separator()
   private let quitItem = NSMenuItem(
-    title: "Quit Codex Not Sleep",
+    title: "Quit",
     action: #selector(quit(_:)),
     keyEquivalent: "q"
   )
@@ -33,11 +38,13 @@ final class CodexNotSleepMenuBarController: NSObject, NSMenuDelegate {
     menu.delegate = self
     menu.autoenablesItems = false
     stayAwakeItem.target = self
+    closedLidItem.target = self
     issueItem.target = self
     quitItem.target = self
     quitItem.keyEquivalentModifierMask = [.command]
 
     menu.addItem(stayAwakeItem)
+    menu.addItem(closedLidItem)
     menu.addItem(.separator())
     menu.addItem(issueItem)
     menu.addItem(issueSeparator)
@@ -79,6 +86,14 @@ final class CodexNotSleepMenuBarController: NSObject, NSMenuDelegate {
     stayAwakeItem.state = controller.isProtectionEnabled ? .on : .off
     stayAwakeItem.isEnabled = !controller.isPreparingProtection
 
+    if let closedLidTitle = controller.closedLidMenuTitle {
+      closedLidItem.title = closedLidTitle
+      closedLidItem.isHidden = false
+      closedLidItem.isEnabled = !controller.isPreparingClosedLid
+    } else {
+      closedLidItem.isHidden = true
+    }
+
     if let issue = controller.menuIssue {
       issueItem.title = issue.title
       issueItem.isHidden = false
@@ -97,6 +112,11 @@ final class CodexNotSleepMenuBarController: NSObject, NSMenuDelegate {
 
   @objc private func resolveIssue(_ sender: Any?) {
     controller.resolveMenuIssue()
+    updateMenu()
+  }
+
+  @objc private func toggleClosedLid(_ sender: Any?) {
+    controller.toggleClosedLidProtection()
     updateMenu()
   }
 
