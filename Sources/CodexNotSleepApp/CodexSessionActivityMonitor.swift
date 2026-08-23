@@ -117,10 +117,12 @@ struct FSEventsObserverConfiguration: Equatable, Sendable {
 
 protocol CodexSessionFileChangeObserving: AnyObject {
   func takeChanges() -> CodexSessionFileChanges
+  func reset()
   var isEventSourceHealthy: Bool { get }
 }
 
 extension CodexSessionFileChangeObserving {
+  func reset() {}
   var isEventSourceHealthy: Bool { true }
 }
 
@@ -128,6 +130,26 @@ private protocol CodexSessionFileChangeNotifying: AnyObject {
   func start(onChange: @escaping @Sendable () -> Void)
   func stop()
   var isEventSourceHealthy: Bool { get }
+}
+
+protocol FSEventsRetryScheduling {
+  func schedule(
+    after delay: TimeInterval,
+    on queue: DispatchQueue,
+    operation: @escaping @Sendable () -> Void
+  ) -> DispatchWorkItem
+}
+
+struct DispatchFSEventsRetryScheduler: FSEventsRetryScheduling {
+  func schedule(
+    after delay: TimeInterval,
+    on queue: DispatchQueue,
+    operation: @escaping @Sendable () -> Void
+  ) -> DispatchWorkItem {
+    let workItem = DispatchWorkItem(block: operation)
+    queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    return workItem
+  }
 }
 
 final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
@@ -146,6 +168,8 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
   private let stopStreamOverride: (() -> Void)?
   private let releaseStreamOverride: (() -> Void)?
   private let retryDelays: [TimeInterval]
+  private let slowRetryDelay: TimeInterval
+  private let retryScheduler: any FSEventsRetryScheduling
   private var pendingChanges = CodexSessionFileChanges()
   private var callbackCount = 0
   private var stream: FSEventStreamRef?
@@ -156,8 +180,10 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
   private var eventSourceHealthy = true
   private var retryAttempt = 0
   private var retryWorkItem: DispatchWorkItem?
+  private var slowRetryWorkItem: DispatchWorkItem?
 
   private static let defaultRetryDelays: [TimeInterval] = [1, 2, 4, 8, 16, 30]
+  private static let defaultSlowRetryDelay: TimeInterval = 5 * 60
 
   init(
     sessionRoot: URL,
@@ -166,7 +192,9 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
     startStream: (() -> Bool)? = nil,
     stopStream: (() -> Void)? = nil,
     releaseStream: (() -> Void)? = nil,
-    retryDelays: [TimeInterval] = FSEventsCodexSessionFileChangeObserver.defaultRetryDelays
+    retryDelays: [TimeInterval] = FSEventsCodexSessionFileChangeObserver.defaultRetryDelays,
+    slowRetryDelay: TimeInterval = FSEventsCodexSessionFileChangeObserver.defaultSlowRetryDelay,
+    retryScheduler: any FSEventsRetryScheduling = DispatchFSEventsRetryScheduler()
   ) {
     self.sessionRoot = sessionRoot
     self.configuration = configuration
@@ -175,6 +203,8 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
     stopStreamOverride = stopStream
     releaseStreamOverride = releaseStream
     self.retryDelays = retryDelays.isEmpty ? Self.defaultRetryDelays : retryDelays
+    self.slowRetryDelay = max(slowRetryDelay, 0.01)
+    self.retryScheduler = retryScheduler
     queue.setSpecific(key: queueKey, value: queueToken)
   }
 
@@ -252,7 +282,7 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
       guard !isStarted else { return }
       // A retry already owns the next start attempt. Repeated refreshes or
       // callbacks must not bypass its backoff and create a start storm.
-      guard retryWorkItem == nil else { return }
+      guard retryWorkItem == nil, slowRetryWorkItem == nil else { return }
       if retryWorkItem == nil, retryAttempt >= retryDelays.count {
         retryAttempt = 0
       }
@@ -261,7 +291,7 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
   }
 
   func stop() {
-    onOwnerQueue { disposeLocked(clearPendingChanges: false) }
+    onOwnerQueue { disposeLocked() }
   }
 
   func takeChanges() -> CodexSessionFileChanges {
@@ -269,6 +299,12 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
       let changes = pendingChanges
       pendingChanges = CodexSessionFileChanges()
       return changes
+    }
+  }
+
+  func reset() {
+    onOwnerQueue {
+      pendingChanges = CodexSessionFileChanges()
     }
   }
 
@@ -357,23 +393,45 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
   }
 
   private func scheduleRetryLocked() {
-    guard wantsMonitoring, retryWorkItem == nil, retryAttempt < retryDelays.count else {
+    guard wantsMonitoring, retryWorkItem == nil, slowRetryWorkItem == nil else { return }
+
+    if retryAttempt < retryDelays.count {
+      let delay = max(retryDelays[retryAttempt], 0.01)
+      retryAttempt += 1
+      let workItem = retryScheduler.schedule(
+        after: delay,
+        on: queue,
+        operation: { [weak self] in
+          guard let self else { return }
+          self.retryWorkItem = nil
+          self.startStreamLocked()
+        }
+      )
+      retryWorkItem = workItem
       return
     }
-    let delay = max(retryDelays[retryAttempt], 0.01)
-    retryAttempt += 1
-    let workItem = DispatchWorkItem { [weak self] in
-      guard let self else { return }
-      self.retryWorkItem = nil
-      self.startStreamLocked()
-    }
-    retryWorkItem = workItem
-    queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+
+    // Fast retries are intentionally finite. While the observer is unhealthy
+    // the worker's fallback reconciliation remains active, and this rare
+    // cooldown gives the source a low-frequency self-healing path without a
+    // rapid retry loop.
+    let workItem = retryScheduler.schedule(
+      after: slowRetryDelay,
+      on: queue,
+      operation: { [weak self] in
+        guard let self else { return }
+        self.slowRetryWorkItem = nil
+        self.startStreamLocked()
+      }
+    )
+    slowRetryWorkItem = workItem
   }
 
   private func cancelRetryLocked() {
     retryWorkItem?.cancel()
     retryWorkItem = nil
+    slowRetryWorkItem?.cancel()
+    slowRetryWorkItem = nil
   }
 
   private func disposeLocked(clearPendingChanges: Bool = true) {
@@ -424,12 +482,17 @@ protocol CodexOpenSessionEventSource: AnyObject {
   func stopMonitoring()
 }
 
+private protocol CodexOpenSessionStateResetting: AnyObject {
+  func resetMonitoringState()
+}
+
 private protocol CodexKnownFileContinuationRequesting: AnyObject {
   func requestKnownFileContinuation()
 }
 
 final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating,
-  CodexOpenSessionEventSource, CodexKnownFileContinuationRequesting
+  CodexOpenSessionEventSource, CodexOpenSessionStateResetting,
+  CodexKnownFileContinuationRequesting
 {
   private static let discoveryInterval: TimeInterval = 5 * 60
   private static let processStartTolerance: TimeInterval = 5
@@ -568,6 +631,22 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating,
 
   func stopMonitoring() {
     (changeObserver as? CodexSessionFileChangeNotifying)?.stop()
+    resetMonitoringState()
+  }
+
+  func resetMonitoringState() {
+    // A stopped runtime must not carry a previous process table, FD
+    // correlation, discovered path, or known-file continuation into the next
+    // monitoring generation. The next refresh is therefore a real discovery
+    // of the current Codex runtime.
+    discoveredPaths.removeAll(keepingCapacity: false)
+    discoveryWasReliable = true
+    discoveredForRuntimeStartedAt = nil
+    lastDiscoveryAt = .distantPast
+    cachedInventory = nil
+    continuationRequested = false
+    metrics = CodexLocatorMetrics()
+    changeObserver.reset()
   }
 
   private func canUseCachedInventoryForContinuation(
@@ -1161,6 +1240,7 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     hasObservedSession = false
     snapshot = .idle
     metrics.trackedStateCount = 0
+    (locator as? any CodexOpenSessionStateResetting)?.resetMonitoringState()
   }
 
   func requestPendingWorkContinuation() {

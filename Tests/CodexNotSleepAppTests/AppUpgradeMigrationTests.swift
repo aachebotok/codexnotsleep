@@ -139,6 +139,72 @@ struct AppUpgradeMigrationTests {
     )
   }
 
+  @Test
+  func delayedSuccessfulRecycleKeepsControllerAliveUntilCompletion() throws {
+    let defaults = try makeDefaults()
+    let oldApp = try makeLegacyBundle()
+    defer {
+      defaults.removePersistentDomain(forName: defaultsSuiteName(defaults))
+      try? FileManager.default.removeItem(at: oldApp)
+    }
+
+    let prompt = TestMigrationPrompt(choice: .moveOldAppToTrash)
+    let recycler = TestMigrationRecycler(autoComplete: false)
+    weak var weakController: CodexetineUpgradeMigrationController?
+    do {
+      let controller = makeController(
+        defaults: defaults,
+        oldApp: oldApp,
+        prompt: prompt,
+        recycler: recycler
+      )
+      weakController = controller
+      controller.checkAndOfferMigration()
+      #expect(weakController != nil)
+      #expect(defaults.bool(forKey: CodexetineUpgradeMigrationController.promptShownKey))
+      recycler.finish(true)
+    }
+
+    #expect(defaults.bool(forKey: CodexetineUpgradeMigrationController.promptShownKey))
+    #expect(recycler.recycledURLs == [oldApp.standardizedFileURL])
+  }
+
+  @Test
+  func delayedFailedRecycleResetsBookkeepingAndAllowsExplicitRetry() throws {
+    let defaults = try makeDefaults()
+    let oldApp = try makeLegacyBundle()
+    defer {
+      defaults.removePersistentDomain(forName: defaultsSuiteName(defaults))
+      try? FileManager.default.removeItem(at: oldApp)
+    }
+
+    let firstPrompt = TestMigrationPrompt(choice: .moveOldAppToTrash)
+    let firstRecycler = TestMigrationRecycler(autoComplete: false)
+    let firstController = makeController(
+      defaults: defaults,
+      oldApp: oldApp,
+      prompt: firstPrompt,
+      recycler: firstRecycler
+    )
+    firstController.checkAndOfferMigration()
+    firstRecycler.finish(false)
+    #expect(!defaults.bool(forKey: CodexetineUpgradeMigrationController.promptShownKey))
+
+    let retryPrompt = TestMigrationPrompt(choice: .moveOldAppToTrash)
+    let retryRecycler = TestMigrationRecycler()
+    let retryController = makeController(
+      defaults: defaults,
+      oldApp: oldApp,
+      prompt: retryPrompt,
+      recycler: retryRecycler
+    )
+    retryController.checkAndOfferMigration()
+
+    #expect(retryPrompt.callCount == 1)
+    #expect(retryRecycler.recycledURLs == [oldApp.standardizedFileURL])
+    #expect(defaults.bool(forKey: CodexetineUpgradeMigrationController.promptShownKey))
+  }
+
   private func makeLegacyBundle() throws -> URL {
     let url = FileManager.default.temporaryDirectory
       .appending(path: "Codexetine.LegacyMigrationTests.\(UUID().uuidString).app")
@@ -183,12 +249,28 @@ private final class TestMigrationPrompt: CodexetineMigrationPrompting {
 @MainActor
 private final class TestMigrationRecycler: CodexetineMigrationRecycling {
   private(set) var recycledURLs: [URL] = []
+  private let autoComplete: Bool
+  private var completion: (@MainActor @Sendable (Bool) -> Void)?
+
+  init(autoComplete: Bool = true) {
+    self.autoComplete = autoComplete
+  }
 
   func recycle(
     _ url: URL,
     completion: @escaping @MainActor @Sendable (Bool) -> Void
   ) {
     recycledURLs.append(url.standardizedFileURL)
-    completion(true)
+    if autoComplete {
+      completion(true)
+    } else {
+      self.completion = completion
+    }
+  }
+
+  func finish(_ succeeded: Bool) {
+    let completion = self.completion
+    self.completion = nil
+    completion?(succeeded)
   }
 }

@@ -918,6 +918,109 @@ struct CodexSessionActivityMonitorTests {
   }
 
   @Test
+  func eventSourceExhaustionUsesSlowCooldownAndCanSelfHeal() throws {
+    let fixture = try SessionFixture()
+    let starts = LockedCounter()
+    let scheduler = ManualFSEventsRetryScheduler()
+    var shouldStart = false
+    let observer = FSEventsCodexSessionFileChangeObserver(
+      sessionRoot: fixture.directory,
+      createStream: { true },
+      startStream: {
+        starts.increment()
+        return shouldStart
+      },
+      retryDelays: [0.01, 0.02],
+      slowRetryDelay: 300,
+      retryScheduler: scheduler
+    )
+
+    observer.start {}
+    #expect(starts.value == 1)
+    #expect(scheduler.pendingDelays == [0.01])
+
+    scheduler.fireNext()
+    scheduler.fireNext()
+
+    #expect(starts.value == 3)
+    #expect(!observer.isEventSourceHealthy)
+    #expect(scheduler.pendingDelays == [300])
+    #expect(scheduler.scheduledDelays == [0.01, 0.02, 300])
+
+    shouldStart = true
+    scheduler.fireNext()
+
+    #expect(starts.value == 4)
+    #expect(observer.isEventSourceHealthy)
+    #expect(scheduler.pendingDelays.isEmpty)
+    observer.stop()
+  }
+
+  @Test
+  func eventSourceSlowCooldownRepeatsRarelyAndStopCancelsIt() throws {
+    let fixture = try SessionFixture()
+    let starts = LockedCounter()
+    let scheduler = ManualFSEventsRetryScheduler()
+    let observer = FSEventsCodexSessionFileChangeObserver(
+      sessionRoot: fixture.directory,
+      createStream: { true },
+      startStream: {
+        starts.increment()
+        return false
+      },
+      retryDelays: [0.01],
+      slowRetryDelay: 600,
+      retryScheduler: scheduler
+    )
+
+    observer.start {}
+    observer.start {}
+    #expect(starts.value == 1)
+    scheduler.fireNext()
+    #expect(starts.value == 2)
+    #expect(scheduler.pendingDelays == [600])
+
+    scheduler.fireNext()
+    #expect(starts.value == 3)
+    #expect(scheduler.pendingDelays == [600])
+    #expect(scheduler.scheduledDelays == [0.01, 600, 600])
+
+    observer.start {}
+    #expect(starts.value == 3)
+    observer.stop()
+    #expect(scheduler.pendingDelays.isEmpty)
+  }
+
+  @Test
+  func stopStartClearsLocatorAndMonitorStateBeforeDiscoveringReplacementRuntime() throws {
+    let fixture = try SessionFixture()
+    let first = try fixture.makeRootSession(events: [start("A")])
+    let inspector = MutableCodexProcessInspector(
+      processes: [CodexRuntimeProcess(processID: 101, startedAt: ownerStartedAt)],
+      pathsByProcessID: [101: [first.path]]
+    )
+    let locator = LibprocCodexOpenSessionLocator(
+      sessionRoot: fixture.directory,
+      userID: 501,
+      processInspector: inspector,
+      minimumDiscoveryInterval: 60 * 60
+    )
+    let monitor = CodexSessionActivityMonitor(locator: locator)
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+    monitor.stopMonitoring()
+    monitor.reset()
+
+    try FileManager.default.removeItem(at: first)
+    let second = try fixture.makeRootSession(name: "replacement", events: [start("B")])
+    inspector.pathsByProcessID = [101: [second.path]]
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+    let inventory = try locator.locateOpenSessions()
+    #expect(inventory.files.map(\.url) == [second.standardizedFileURL])
+  }
+
+  @Test
   func eventSourceCanRestartAfterACompletedStop() async throws {
     let fixture = try SessionFixture()
     let creates = LockedCounter()
@@ -1120,6 +1223,72 @@ private final class FakeCodexSessionFileChangeObserver: CodexSessionFileChangeOb
   func takeChanges() -> CodexSessionFileChanges {
     defer { changes = CodexSessionFileChanges() }
     return changes
+  }
+}
+
+private final class ManualFSEventsRetryScheduler: FSEventsRetryScheduling, @unchecked Sendable {
+  private struct Entry {
+    let delay: TimeInterval
+    let queue: DispatchQueue
+    let workItem: DispatchWorkItem
+  }
+
+  private let lock = NSLock()
+  private var entries: [Entry] = []
+  private var history: [TimeInterval] = []
+
+  var scheduledDelays: [TimeInterval] {
+    lock.withLock { history }
+  }
+
+  var pendingDelays: [TimeInterval] {
+    lock.withLock {
+      entries.filter { !$0.workItem.isCancelled }.map(\.delay)
+    }
+  }
+
+  func schedule(
+    after delay: TimeInterval,
+    on queue: DispatchQueue,
+    operation: @escaping @Sendable () -> Void
+  ) -> DispatchWorkItem {
+    let workItem = DispatchWorkItem(block: operation)
+    lock.withLock {
+      entries.append(Entry(delay: delay, queue: queue, workItem: workItem))
+      history.append(delay)
+    }
+    return workItem
+  }
+
+  func fireNext() {
+    while true {
+      let entry: Entry? = lock.withLock {
+        guard !entries.isEmpty else { return nil }
+        return entries.removeFirst()
+      }
+      guard let entry else { return }
+      guard !entry.workItem.isCancelled else { continue }
+      entry.queue.sync { entry.workItem.perform() }
+      return
+    }
+  }
+}
+
+private final class MutableCodexProcessInspector: CodexProcessInspecting {
+  let processes: [CodexRuntimeProcess]
+  var pathsByProcessID: [pid_t: [String]]
+
+  init(processes: [CodexRuntimeProcess], pathsByProcessID: [pid_t: [String]]) {
+    self.processes = processes
+    self.pathsByProcessID = pathsByProcessID
+  }
+
+  func currentUserCodexProcesses(userID _: uid_t) -> [CodexRuntimeProcess]? {
+    processes
+  }
+
+  func openFilePaths(processID: pid_t) -> [String]? {
+    pathsByProcessID[processID] ?? []
   }
 }
 

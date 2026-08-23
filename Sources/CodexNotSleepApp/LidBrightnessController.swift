@@ -572,6 +572,9 @@ final class SystemDisplayBrightnessProvider: DisplayBrightnessProviding {
 protocol LidBrightnessControlling: AnyObject {
   func setCodexWorking(_ isWorking: Bool)
   func reset()
+  /// Synchronous, best-effort cleanup for an external termination callback.
+  /// It must not create work that expects the process to remain alive.
+  func restoreForExternalTermination() -> BrightnessRestoreResult
   func restoreForShutdown(
     completion: @escaping @MainActor @Sendable (BrightnessRestoreResult) -> Void
   )
@@ -583,6 +586,8 @@ enum BrightnessRestoreResult: Equatable, Sendable {
 }
 
 extension LidBrightnessControlling {
+  func restoreForExternalTermination() -> BrightnessRestoreResult { .restored }
+
   func restoreForShutdown(
     completion: @escaping @MainActor @Sendable (BrightnessRestoreResult) -> Void
   ) {
@@ -673,6 +678,19 @@ final class LidBrightnessController: LidBrightnessControlling {
     angleSensor.stopMonitoring()
     cancelRestoreRetry(resetAttempt: true)
     restoreBrightness(stopping: true)
+  }
+
+  /// Performs one bounded synchronous restore attempt during
+  /// `applicationWillTerminate`. External termination cannot safely await a
+  /// task or schedule a delayed retry, so any remaining app-owned brightness
+  /// state is reported as best-effort failure while sleep cleanup continues.
+  func restoreForExternalTermination() -> BrightnessRestoreResult {
+    isCodexWorking = false
+    angleSensor.stopMonitoring()
+    cancelRestoreRetry(resetAttempt: true)
+    timer?.invalidate()
+    timer = nil
+    return attemptBrightnessRestore() ? .restored : .exhausted
   }
 
   /// Performs the last bounded restore before the process is allowed to

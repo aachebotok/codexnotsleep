@@ -914,16 +914,29 @@ final class AppController: NSObject {
     activityWorker.stop()
     activityWorker.reset()
     removeTerminationObserver()
-    lidBrightnessController.restoreForShutdown { [weak self] result in
-      guard let self else { return }
-      if result == .exhausted {
-        NSLog("Codexetine bounded brightness restoration exhausted during shutdown")
+    let brightnessResult = lidBrightnessController.restoreForExternalTermination()
+    if brightnessResult == .exhausted {
+      NSLog("Codexetine synchronous brightness restoration exhausted during external termination")
+    }
+
+    let releaseResult: Result<Void, Error>
+    if usesBackgroundSystemWork {
+      releaseResult = backendWorker.releaseSynchronously()
+    } else {
+      do {
+        try backend.release()
+        releaseResult = .success(())
+      } catch {
+        releaseResult = .failure(error)
       }
-      if usesBackgroundSystemWork {
-        backendWorker.release { _ in }
-      } else {
-        try? backend.release()
-      }
+    }
+    if case .failure(let error) = releaseResult {
+      // The lease/watchdog remains the final recovery path for privileged
+      // global state when the bounded synchronous release cannot complete.
+      NSLog(
+        "Codexetine synchronous sleep restoration failed during external termination: %@",
+        error.localizedDescription
+      )
     }
   }
 

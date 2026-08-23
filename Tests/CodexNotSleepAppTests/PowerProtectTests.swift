@@ -130,6 +130,115 @@ struct PowerProtectTests {
   }
 
   @Test
+  func productionClosedLidWrapperPreservesSetupCauseDuringRestore() throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+      path: "CodexNotSleep.PowerProtectSetupCause.\(UUID().uuidString)"
+    )
+    let runner = RecordingPowerProtectRunner(results: [Self.pmsetState(true)])
+    let leaseStore = PowerProtectLeaseStore(url: root.appending(path: "lease"))
+    let watchdog = FakePowerProtectWatchdog()
+    let installer = FakePowerProtectInstaller(isInstalled: false, hasRuleFile: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    _ = try leaseStore.begin()
+    let closedLid = PMSetPowerProtectBackend(
+      installer: installer,
+      runner: runner,
+      leaseStore: leaseStore,
+      watchdog: watchdog
+    )
+    let backend = CombinedSleepProtectionBackend(
+      idleSleep: PartialSleepProtectionBackend(isHeld: true),
+      closedLid: closedLid
+    )
+
+    do {
+      try backend.release()
+      Issue.record("Expected the production wrapper to preserve setup repair")
+    } catch let error as ClosedLidProtectionError {
+      #expect(error == .setupRequired)
+    }
+    #expect(closedLid.isHeld)
+    #expect(leaseStore.hasLease)
+  }
+
+  @Test
+  func productionSetupRepairRevalidatesThenUsesTargetedClosedLidRelease() throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+      path: "CodexNotSleep.PowerProtectControllerRepair.\(UUID().uuidString)"
+    )
+    let defaultsName = "CodexNotSleep.PowerProtectControllerRepair.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    let runner = RecordingPowerProtectRunner(
+      results: [
+        Self.pmsetState(true),
+        Self.pmsetState(true), Self.commandSucceeded(), Self.pmsetState(false),
+      ]
+    )
+    let leaseStore = PowerProtectLeaseStore(url: root.appending(path: "lease"))
+    let watchdog = FakePowerProtectWatchdog()
+    let installer = FakePowerProtectInstaller(isInstalled: false, hasRuleFile: true)
+    defer {
+      defaults.removePersistentDomain(forName: defaultsName)
+      try? FileManager.default.removeItem(at: root)
+    }
+
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+    defaults.set(true, forKey: ProtectionPreferenceStore.closedLidKey)
+    _ = try leaseStore.begin()
+
+    let idle = PartialSleepProtectionBackend(isHeld: true)
+    let closedLid = PMSetPowerProtectBackend(
+      installer: installer,
+      runner: runner,
+      leaseStore: leaseStore,
+      watchdog: watchdog
+    )
+    let backend = CombinedSleepProtectionBackend(idleSleep: idle, closedLid: closedLid)
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: PowerProtectTestActivityProvider(),
+      protectionGraceSeconds: 0,
+      startsAutomatically: false
+    )
+
+    controller.setProtectionEnabled(false)
+
+    #expect(controller.menuIssue == .closedLidSetupRepairRequired)
+    #expect(idle.isHeld == false)
+    #expect(closedLid.isHeld)
+
+    controller.resolveMenuIssue()
+
+    #expect(installer.installCount == 1)
+    #expect(controller.menuIssue == nil)
+    #expect(!closedLid.isHeld)
+    #expect(!leaseStore.hasLease)
+    #expect(idle.isHeld == false)
+  }
+
+  @Test
+  func genericProductionRestoreFailureDoesNotOfferSetupRepair() throws {
+    let fixture = try Fixture(
+      results: [Self.pmsetState(true), Self.commandFailed()]
+    )
+    defer { fixture.cleanup() }
+    let backend = CombinedSleepProtectionBackend(
+      idleSleep: PartialSleepProtectionBackend(isHeld: true),
+      closedLid: fixture.backend
+    )
+    _ = try fixture.leaseStore.begin()
+    do {
+      try backend.release()
+      Issue.record("Expected generic production restore failure")
+    } catch let error as ClosedLidProtectionError {
+      #expect(error == .releaseFailed)
+    }
+    #expect(fixture.backend.isHeld)
+  }
+
+  @Test
   func staleLeaseIsRecoveredBeforeNewProtection() throws {
     let fixture = try Fixture(results: [Self.pmsetState(false)])
     defer { fixture.cleanup() }
@@ -747,18 +856,32 @@ private final class FakeIOPMAssertionManager: IOPMAssertionManaging {
 
 private final class FakePowerProtectInstaller: PowerProtectInstalling {
   var isInstalled: Bool
+  private let ruleFileExists: Bool
+  private(set) var installCount = 0
   var setupState: PowerProtectSetupState {
     isInstalled ? .installedAndValid : .notInstalled
   }
-  var hasRuleFile: Bool { isInstalled }
+  var hasRuleFile: Bool { ruleFileExists }
 
-  init(isInstalled: Bool) {
+  init(isInstalled: Bool, hasRuleFile: Bool? = nil) {
     self.isInstalled = isInstalled
+    ruleFileExists = hasRuleFile ?? isInstalled
   }
 
   func install() throws {
+    installCount += 1
     isInstalled = true
   }
+}
+
+private final class PowerProtectTestActivityProvider: CodexActivityProviding {
+  var snapshot: CodexActivitySnapshot = .idle
+
+  var hasPendingWork: Bool { false }
+  var isEventSourceHealthy: Bool { true }
+
+  @discardableResult
+  func refresh() -> CodexActivitySnapshot { snapshot }
 }
 
 private final class FakePowerProtectWatchdog: PowerProtectWatchdogControlling {

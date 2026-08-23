@@ -84,15 +84,26 @@ The FSEvents observer watches the Codex session root with file events and root
 watch enabled. One dedicated queue owns stream creation, start, stop,
 invalidate, release, restart, and health state. Dropped or root-change flags
 force discovery on the next refresh. A failed start marks the source unhealthy
-and uses finite one-shot retry delays; the worker temporarily uses the 30
-second fallback cadence and retries the source from that recovery path. Once a
-session is known, a file event updates the cached inventory and the monitor
-reads the appended bytes without a global process/FD scan. The locator uses
+and uses the finite fast retry sequence `1, 2, 4, 8, 16, 30` seconds. After
+those attempts are exhausted, the same observer owner schedules a rare five
+minute cooldown retry while the worker uses the 30-second fallback cadence;
+the worker never starts a second observer or bypasses that backoff. A later
+successful start cancels the slow retry and returns the worker to its normal
+adaptive cadence. Once a session is known, a file event updates the cached
+inventory and the monitor reads the appended bytes without a global process/FD
+scan. The locator uses
 `sysctl`/`libproc` and file-descriptor inspection when discovering a runtime,
 recovering from an invalidated cache, or running scheduled safety
 reconciliation. Candidate paths are capped at 256 and expire after 30 minutes;
 historical date partitions are pruned before descent and enumeration is capped
 at 2,048 entries. There is no one-second full scan loop.
+
+Stopping monitoring cancels both retry phases, clears pending event paths and
+full-scan flags, invalidates the cached inventory and discovered paths, and
+resets the monitor's bounded per-session state. Each worker start receives a
+new monitoring generation; callbacks and snapshots from an earlier generation
+are discarded, so the first refresh after a new start discovers the current
+runtime rather than trusting the previous one.
 
 The monitor keeps bounded per-file state: file identity, committed offset,
 up to 64 KiB of a partial final line, current turn identity, minimal lifecycle
@@ -169,6 +180,13 @@ failures do not affect sleep protection. Previous values are restored on lid
 opening, task completion, protection disable, reset, and quit. Display and
 keyboard restoration are independent and use a finite one-shot retry budget;
 sleep protection does not depend on brightness success.
+
+The menu Quit path may await that finite brightness budget before terminating.
+The external `applicationWillTerminate` path cannot await a later callback, so
+it performs one synchronous best-effort brightness restore and a synchronous,
+serially ordered backend release. If privileged restoration still fails, the
+app-owned lease and watchdog remain the recovery path; no delayed task is
+started during process termination.
 
 ## Battery and login behavior
 

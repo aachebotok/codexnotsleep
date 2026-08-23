@@ -129,6 +129,7 @@ final class CodexNotSleepMenuBarController: NSObject, NSMenuDelegate {
 @MainActor
 final class CodexNotSleepApplicationDelegate: NSObject, NSApplicationDelegate {
   private var menuBarController: CodexNotSleepMenuBarController?
+  private var upgradeMigrationController: CodexetineUpgradeMigrationController?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     if CommandLine.arguments.contains("--preview-power-protect-prompt") {
@@ -143,7 +144,9 @@ final class CodexNotSleepApplicationDelegate: NSObject, NSApplicationDelegate {
     let menuBarController = CodexNotSleepMenuBarController(controller: controller)
     menuBarController.install()
     self.menuBarController = menuBarController
-    CodexetineUpgradeMigrationController().checkAndOfferMigration()
+    let migrationController = CodexetineUpgradeMigrationController()
+    self.upgradeMigrationController = migrationController
+    migrationController.checkAndOfferMigration()
   }
 }
 

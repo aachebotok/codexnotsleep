@@ -20,6 +20,12 @@ Download the latest `.dmg`, open it, and drag **Codexetine** to the Applications
 
 ### Upgrading from Codex Not Sleep
 
+For a clean upgrade:
+
+1. Quit **Codex Not Sleep**.
+2. Install and open **Codexetine**.
+3. If the old app is still in **/Applications**, Codexetine can offer to move it to the Trash.
+
 Codexetine keeps the historical bundle identifier so existing preferences and
 login-item registration can continue to work. If **/Applications/Codex Not Sleep.app**
 is still present, the first launch of the installed Codexetine app shows a

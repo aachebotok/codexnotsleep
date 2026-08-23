@@ -521,7 +521,7 @@ struct AppControllerTests {
   }
 
   @Test
-  func failedQuitRearmsMonitoringAndBatteryCallbacks() throws {
+  func failedQuitRearmsMonitoringAndBatteryCallbacks() async throws {
     let defaults = try makeDefaults()
     defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
     defaults.set(true, forKey: ProtectionPreferenceStore.key)
@@ -546,6 +546,9 @@ struct AppControllerTests {
     #expect(controller.menuIssue == .sleepRestoreRequired)
     #expect(battery.startCount >= 2)
     #expect(battery.stopCount == 1)
+    for _ in 0..<40 where activity.startMonitoringCount < 2 {
+      try await Task.sleep(for: .milliseconds(5))
+    }
     #expect(activity.startMonitoringCount >= 2)
     #expect(activity.stopMonitoringCount == 1)
   }
@@ -577,6 +580,35 @@ struct AppControllerTests {
 
     #expect(backend.releaseCount == 1)
     #expect(controller.menuIssue == .sleepRestoreRequired)
+  }
+
+  @Test
+  func externalTerminationUsesSynchronousBrightnessAndBackendCleanup() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+
+    let backend = TestSleepProtectionBackend()
+    let brightness = TestShutdownBrightnessController()
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: TestCodexActivityProvider(snapshot: .active(turnCount: 1)),
+      protectionGraceSeconds: 0,
+      startsAutomatically: false,
+      lidBrightnessController: brightness
+    )
+
+    controller.start()
+    controller.refreshCodexActivity()
+    #expect(backend.isHeld)
+
+    NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
+
+    #expect(brightness.externalRestoreCount == 1)
+    #expect(brightness.shutdownRestoreCount == 0)
+    #expect(backend.releaseCount == 1)
+    #expect(!backend.isHeld)
   }
 
   @Test
@@ -827,13 +859,21 @@ private final class TestBatteryStatusProvider: BatteryStatusProviding, @unchecke
 @MainActor
 private final class TestShutdownBrightnessController: LidBrightnessControlling {
   private var completion: (@MainActor @Sendable (BrightnessRestoreResult) -> Void)?
+  private(set) var shutdownRestoreCount = 0
+  private(set) var externalRestoreCount = 0
 
   func setCodexWorking(_ isWorking: Bool) {}
   func reset() {}
 
+  func restoreForExternalTermination() -> BrightnessRestoreResult {
+    externalRestoreCount += 1
+    return .restored
+  }
+
   func restoreForShutdown(
     completion: @escaping @MainActor @Sendable (BrightnessRestoreResult) -> Void
   ) {
+    shutdownRestoreCount += 1
     self.completion = completion
   }
 

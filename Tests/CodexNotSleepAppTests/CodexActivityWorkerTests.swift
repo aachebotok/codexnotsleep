@@ -79,6 +79,35 @@ struct CodexActivityWorkerTests {
     #expect(scheduledInterval == CodexActivityWorker.fallbackReconciliationInterval)
     #expect(provider.startCount == 1)
   }
+
+  @Test
+  func staleEventFromPreviousMonitoringGenerationCannotScheduleRefresh() async throws {
+    let provider = WorkerActivityProvider(snapshot: .active(turnCount: 1))
+    let worker = CodexActivityWorker(provider: provider)
+    worker.start { _ in }
+
+    for _ in 0..<30 where provider.startCount < 1 {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    worker.stop()
+    for _ in 0..<30 where provider.stopCount < 1 {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    worker.start { _ in }
+    for _ in 0..<30 where provider.startCount < 2 {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    for _ in 0..<30 where provider.refreshCount < 2 {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+
+    let refreshCountAfterRestart = provider.refreshCount
+    provider.emitStaleChange()
+    try await Task.sleep(for: .milliseconds(40))
+    worker.stop()
+
+    #expect(provider.refreshCount == refreshCountAfterRestart)
+  }
 }
 
 private final class WorkerActivityProvider: CodexActivityProviding, @unchecked Sendable {
@@ -86,6 +115,7 @@ private final class WorkerActivityProvider: CodexActivityProviding, @unchecked S
   private var storedSnapshot: CodexActivitySnapshot
   private var refreshSequence: [CodexActivitySnapshot] = []
   private var changeHandler: (@Sendable () -> Void)?
+  private var handlers: [@Sendable () -> Void] = []
   var isEventSourceHealthy = true
   private(set) var startCount = 0
   private(set) var stopCount = 0
@@ -133,6 +163,7 @@ private final class WorkerActivityProvider: CodexActivityProviding, @unchecked S
   func startMonitoring(onChange: @escaping @Sendable () -> Void) {
     lock.lock()
     changeHandler = onChange
+    handlers.append(onChange)
     startCount += 1
     lock.unlock()
   }
@@ -147,6 +178,13 @@ private final class WorkerActivityProvider: CodexActivityProviding, @unchecked S
   func emitChange() {
     lock.lock()
     let handler = changeHandler
+    lock.unlock()
+    handler?()
+  }
+
+  func emitStaleChange() {
+    lock.lock()
+    let handler = handlers.first
     lock.unlock()
     handler?()
   }

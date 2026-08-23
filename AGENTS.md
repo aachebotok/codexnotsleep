@@ -89,6 +89,13 @@ If the tree changes, update this map.
 - Stale historical sessions must not keep the Mac awake indefinitely.
 - Reconciliation backs off while the runtime is reliably idle and remains shorter only
   while activity is active or uncertain.
+- FSEvents start recovery uses the finite fast sequence `[1, 2, 4, 8, 16, 30]`
+  seconds, then a rare cooldown retry; fallback reconciliation remains active
+  while the source is unhealthy, and the worker does not bypass the observer's
+  retry owner.
+- Stop clears pending event changes, locator inventory/discovered paths, and
+  monitor session state. A new monitoring generation rejects stale callbacks
+  and snapshots from the previous start.
 - Uncertainty may protect conservatively for a bounded recovery window, but not forever.
 
 ## Concurrency invariants
@@ -98,6 +105,8 @@ If the tree changes, update this map.
 - Prefer one clearly-owned monitor actor or serial worker over detached-task sprawl.
 - Overlapping refreshes/reconciliations must be serialized or generation-ordered.
 - Stale asynchronous results must not overwrite newer state.
+- Monitoring callbacks and snapshots carry an explicit start generation so a
+  Stop→Start cycle cannot reapply results from the previous runtime.
 - Avoid `@unchecked Sendable` unless unavoidable and explicitly justified.
 - Keep Swift 6 concurrency diagnostics clean.
 
@@ -118,6 +127,9 @@ If the tree changes, update this map.
 - The optional `Keep Awake with Lid Closed` action is the only normal path that requests
   administrator setup; ordinary open-lid IOPM protection must remain independent.
 - Never broaden sudo privileges for convenience.
+- External termination uses synchronous bounded best-effort brightness and
+  backend cleanup; only the graceful menu Quit path waits for asynchronous
+  brightness completion.
 
 Critical invariant:
 
@@ -182,6 +194,8 @@ Do not blindly remove or rename old identifiers. Classify each remaining legacy 
 3. accidental leftover.
 
 Keep compatibility-sensitive paths/keys where existing installations rely on them. Add a brief comment for intentionally retained legacy identifiers.
+- The migration controller is strongly owned by the application delegate and
+  keeps delayed recycle bookkeeping alive until its completion.
 
 ## Performance rules
 

@@ -16,14 +16,18 @@ final class CodexActivityWorker: @unchecked Sendable {
     label: "app.codexnotsleep.codex-activity-worker",
     qos: .utility
   )
+  private let queueKey = DispatchSpecificKey<UInt8>()
+  private let queueToken: UInt8 = 1
   private var reconciliationTimer: DispatchSourceTimer?
   private var isStarted = false
+  private var monitoringGeneration: UInt64 = 0
   private var refreshScheduled = false
   private var snapshotHandler: (@MainActor @Sendable (CodexActivitySnapshot) -> Void)?
   private(set) var lastScheduledReconciliationInterval: TimeInterval?
 
   init(provider: any CodexActivityProviding) {
     self.provider = provider
+    queue.setSpecific(key: queueKey, value: queueToken)
   }
 
   func start(
@@ -37,15 +41,17 @@ final class CodexActivityWorker: @unchecked Sendable {
         return
       }
 
+      self.monitoringGeneration &+= 1
+      let generation = self.monitoringGeneration
       self.isStarted = true
       let eventSourceHandler: @Sendable () -> Void = { [weak self] in
-        self?.requestRefresh()
+        self?.requestRefresh(for: generation)
       }
       self.provider.startMonitoring(onChange: eventSourceHandler)
 
       let timer = DispatchSource.makeTimerSource(queue: self.queue)
       timer.setEventHandler { [weak self] in
-        self?.scheduleRefresh()
+        self?.scheduleRefresh(for: generation)
       }
       self.reconciliationTimer = timer
       timer.resume()
@@ -59,6 +65,13 @@ final class CodexActivityWorker: @unchecked Sendable {
     }
   }
 
+  private func requestRefresh(for generation: UInt64) {
+    queue.async { [weak self] in
+      guard let self, self.isStarted, self.monitoringGeneration == generation else { return }
+      self.scheduleRefresh(for: generation)
+    }
+  }
+
   func reset() {
     queue.async { [weak self] in
       guard let self else { return }
@@ -69,6 +82,7 @@ final class CodexActivityWorker: @unchecked Sendable {
   func stop() {
     queue.async { [weak self] in
       guard let self else { return }
+      self.monitoringGeneration &+= 1
       self.isStarted = false
       self.reconciliationTimer?.setEventHandler {}
       self.reconciliationTimer?.cancel()
@@ -80,11 +94,19 @@ final class CodexActivityWorker: @unchecked Sendable {
     }
   }
 
-  private func scheduleRefresh() {
+  private func scheduleRefresh(for generation: UInt64? = nil) {
     guard isStarted, !refreshScheduled else { return }
+    if let generation, generation != monitoringGeneration { return }
+    let refreshGeneration = monitoringGeneration
     refreshScheduled = true
     queue.async { [weak self] in
-      guard let self, self.isStarted else { return }
+      guard let self else { return }
+      guard self.isStarted, self.monitoringGeneration == refreshGeneration else {
+        if self.monitoringGeneration == refreshGeneration {
+          self.refreshScheduled = false
+        }
+        return
+      }
       self.refreshScheduled = false
       let snapshot = self.provider.refresh()
       if self.provider.hasPendingWork {
@@ -93,10 +115,18 @@ final class CodexActivityWorker: @unchecked Sendable {
       }
       self.scheduleReconciliation(for: snapshot)
       guard let snapshotHandler = self.snapshotHandler else { return }
-      DispatchQueue.main.async {
+      DispatchQueue.main.async { [weak self] in
+        guard let self, self.isGenerationCurrent(refreshGeneration) else { return }
         snapshotHandler(snapshot)
       }
     }
+  }
+
+  private func isGenerationCurrent(_ generation: UInt64) -> Bool {
+    if DispatchQueue.getSpecific(key: queueKey) == queueToken {
+      return monitoringGeneration == generation
+    }
+    return queue.sync { monitoringGeneration == generation && isStarted }
   }
 
   private func scheduleReconciliation(for snapshot: CodexActivitySnapshot) {

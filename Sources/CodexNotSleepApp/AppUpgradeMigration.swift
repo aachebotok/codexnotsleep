@@ -110,8 +110,10 @@ final class CodexetineUpgradeMigrationController {
       // running. The alert tells the user to quit it and try again.
       guard !oldAppIsRunning else { return }
       defaults.set(true, forKey: Self.promptShownKey)
-      recycler.recycle(legacyBundleURL) { [weak self] succeeded in
-        guard let self else { return }
+      // The application delegate strongly owns this controller. Keep the
+      // in-flight operation strongly tied to the controller as well so a
+      // delayed NSWorkspace completion cannot lose the failure bookkeeping.
+      recycler.recycle(legacyBundleURL) { [self] succeeded in
         if !succeeded {
           // A failed recycle may be retried explicitly on a later launch.
           defaults.set(false, forKey: Self.promptShownKey)

@@ -96,6 +96,20 @@ final class SleepProtectionWorker: @unchecked Sendable {
     submit({ try $0.release() }, completion: completion)
   }
 
+  /// External termination cannot wait for a main-actor callback. Serializing
+  /// the release on this worker preserves backend ordering while keeping the
+  /// bounded command and watchdog cleanup synchronous before process exit.
+  func releaseSynchronously() -> Result<Void, Error> {
+    queue.sync {
+      do {
+        try backend.release()
+        return .success(())
+      } catch {
+        return .failure(error)
+      }
+    }
+  }
+
   private func submit(
     _ operation: @escaping @Sendable (any SleepProtectionBackend) throws -> Void,
     completion: @escaping @MainActor @Sendable (Result<Void, Error>) -> Void

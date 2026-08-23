@@ -9,6 +9,7 @@ enum PowerProtectError: LocalizedError, Equatable {
   case setupRequired
   case commandFailed
   case restoreFailed
+  case restoreFailedDueToSetupRequired
   case stateVerificationFailed
   case watchdogFailed
 
@@ -24,6 +25,8 @@ enum PowerProtectError: LocalizedError, Equatable {
       "Couldn't prevent sleep with the lid closed"
     case .restoreFailed, .stateVerificationFailed:
       "Couldn't restore normal sleep"
+    case .restoreFailedDueToSetupRequired:
+      "Couldn't restore normal sleep because closed-lid setup is invalid"
     case .watchdogFailed:
       "Couldn't start crash recovery"
     }
@@ -602,7 +605,13 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend,
   private func restoreSleep() throws {
     do {
       if try sleepIsDisabled() {
-        guard !requiresSetup else { throw PowerProtectError.setupRequired }
+        // A stale lease can be cleaned up without sudoers when SleepDisabled
+        // is already clear. If we do need to change the global setting, verify
+        // the exact installed rule first so an invalid rule remains a typed
+        // repair condition instead of becoming a generic restore failure.
+        guard !requiresSetup, installer.isInstalled else {
+          throw PowerProtectError.setupRequired
+        }
         try setSleepDisabled(false)
         guard try !sleepIsDisabled() else {
           throw PowerProtectError.stateVerificationFailed
@@ -614,6 +623,9 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend,
       isHeld = false
     } catch {
       isHeld = leaseStore.hasLease
+      if (error as? PowerProtectError) == .setupRequired {
+        throw PowerProtectError.restoreFailedDueToSetupRequired
+      }
       throw PowerProtectError.restoreFailed
     }
   }
@@ -698,7 +710,7 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend,
     do {
       try closedLid.recover()
     } catch {
-      closedLidError = ClosedLidProtectionError.recoveryFailed
+      closedLidError = Self.closedLidError(for: .recoveryFailed, underlying: error)
     }
 
     // Recovery of ordinary IOPM protection is independent. A stale or broken
@@ -777,13 +789,14 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend,
     case acquisitionFailed
     case renewalFailed
     case releaseFailed
+    case recoveryFailed
   }
 
   private static func closedLidError(
     for operation: ClosedLidOperation,
     underlying: Error
   ) -> ClosedLidProtectionError {
-    if (underlying as? PowerProtectError) == .setupRequired {
+    if Self.isSetupRequiredCause(underlying) {
       return .setupRequired
     }
     switch operation {
@@ -793,6 +806,13 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend,
       return .renewalFailed
     case .releaseFailed:
       return .releaseFailed
+    case .recoveryFailed:
+      return .recoveryFailed
     }
+  }
+
+  private static func isSetupRequiredCause(_ error: Error) -> Bool {
+    guard let error = error as? PowerProtectError else { return false }
+    return error == .setupRequired || error == .restoreFailedDueToSetupRequired
   }
 }

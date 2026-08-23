@@ -419,6 +419,30 @@ struct LidBrightnessControllerTests {
   }
 
   @Test
+  func externalTerminationUsesOneSynchronousBrightnessAttemptWithoutRetryTask() {
+    let sensor = TestLidAngleSensor(angle: 1)
+    let display = TestDisplayBrightnessProvider(brightness: 0.72)
+    let controller = LidBrightnessController(
+      angleSensor: sensor,
+      displayProvider: display,
+      schedulesTimer: false
+    )
+
+    controller.setCodexWorking(true)
+    let start = Date()
+    controller.refreshBrightness(
+      at: start.addingTimeInterval(LidBrightnessController.transitionDuration)
+    )
+    display.failNextWrite = true
+
+    let result = controller.restoreForExternalTermination()
+
+    #expect(result == .exhausted)
+    #expect(!controller.isRestoreRetryScheduled)
+    #expect(!controller.isInterpolationTimerActive)
+  }
+
+  @Test
   func controllerDimsOnlyForConfirmedActiveCodexWork() {
     let suiteName = "CodexNotSleep.LidBrightnessTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!
