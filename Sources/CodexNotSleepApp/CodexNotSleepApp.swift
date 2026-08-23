@@ -143,6 +143,7 @@ final class CodexNotSleepApplicationDelegate: NSObject, NSApplicationDelegate {
     let menuBarController = CodexNotSleepMenuBarController(controller: controller)
     menuBarController.install()
     self.menuBarController = menuBarController
+    CodexetineUpgradeMigrationController().checkAndOfferMigration()
   }
 }
 

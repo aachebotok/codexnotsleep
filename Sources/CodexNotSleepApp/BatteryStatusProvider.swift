@@ -88,6 +88,7 @@ final class IOKitBatteryStatusProvider: BatteryStatusProviding, @unchecked Senda
       changeHandler = nil
       monitoringGeneration &+= 1
       cacheGeneration &+= 1
+      cacheIsValid = false
       let source = notificationSource
       notificationSource = nil
       return source

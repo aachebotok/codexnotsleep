@@ -58,7 +58,7 @@ struct CodexActivityWorkerTests {
   }
 
   @Test
-  func unhealthyEventSourceUsesFallbackCadenceAndRequestsRestart() async throws {
+  func unhealthyEventSourceUsesFallbackCadenceWithoutWorkerRestart() async throws {
     let provider = WorkerActivityProvider(snapshot: .active(turnCount: 1))
     provider.isEventSourceHealthy = false
     let worker = CodexActivityWorker(provider: provider)
@@ -71,10 +71,13 @@ struct CodexActivityWorkerTests {
       try await Task.sleep(for: .milliseconds(10))
     }
     let scheduledInterval = worker.lastScheduledReconciliationInterval
+    provider.emitChange()
+    provider.emitChange()
+    try await Task.sleep(for: .milliseconds(40))
     worker.stop()
 
     #expect(scheduledInterval == CodexActivityWorker.fallbackReconciliationInterval)
-    #expect(provider.startCount >= 2)
+    #expect(provider.startCount == 1)
   }
 }
 

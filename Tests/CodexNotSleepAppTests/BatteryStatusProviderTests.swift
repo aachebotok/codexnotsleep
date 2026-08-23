@@ -101,6 +101,21 @@ struct BatteryStatusProviderTests {
     #expect(await readTask.value == nil)
     #expect(provider.currentStatus() == second)
   }
+
+  @Test
+  func stoppingMonitoringInvalidatesCachedStatusBeforeRestart() {
+    let first = BatteryStatus(chargePercent: 50, isRunningOnBattery: false)
+    let second = BatteryStatus(chargePercent: 5, isRunningOnBattery: true)
+    let fixture = BatteryReadFixture(status: first)
+    let provider = IOKitBatteryStatusProvider(readStatus: fixture.read)
+
+    #expect(provider.currentStatus() == first)
+    fixture.status = second
+    provider.stopMonitoring()
+
+    #expect(provider.currentStatus() == second)
+    #expect(fixture.readCount == 2)
+  }
 }
 
 private final class BatteryReadFixture: @unchecked Sendable {

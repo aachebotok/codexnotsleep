@@ -572,6 +572,22 @@ final class SystemDisplayBrightnessProvider: DisplayBrightnessProviding {
 protocol LidBrightnessControlling: AnyObject {
   func setCodexWorking(_ isWorking: Bool)
   func reset()
+  func restoreForShutdown(
+    completion: @escaping @MainActor @Sendable (BrightnessRestoreResult) -> Void
+  )
+}
+
+enum BrightnessRestoreResult: Equatable, Sendable {
+  case restored
+  case exhausted
+}
+
+extension LidBrightnessControlling {
+  func restoreForShutdown(
+    completion: @escaping @MainActor @Sendable (BrightnessRestoreResult) -> Void
+  ) {
+    completion(.restored)
+  }
 }
 
 @MainActor
@@ -659,6 +675,28 @@ final class LidBrightnessController: LidBrightnessControlling {
     restoreBrightness(stopping: true)
   }
 
+  /// Performs the last bounded restore before the process is allowed to
+  /// terminate. The normal lifecycle retry task is deliberately not reused:
+  /// this callback owns the complete finite budget and always completes.
+  func restoreForShutdown(
+    completion: @escaping @MainActor @Sendable (BrightnessRestoreResult) -> Void
+  ) {
+    isCodexWorking = false
+    angleSensor.stopMonitoring()
+    cancelRestoreRetry(resetAttempt: true)
+    timer?.invalidate()
+    timer = nil
+
+    Task { @MainActor [weak self] in
+      guard let self else {
+        completion(.restored)
+        return
+      }
+      let result = await performShutdownRestore()
+      completion(result)
+    }
+  }
+
   func refreshBrightness(at date: Date = .now) {
     guard isCodexWorking else { return }
     refreshBrightness(at: date, angle: angleSensor.currentAngle())
@@ -703,7 +741,8 @@ final class LidBrightnessController: LidBrightnessControlling {
     advanceTransitions(at: date)
   }
 
-  private func restoreBrightness(stopping: Bool = true) {
+  @discardableResult
+  private func attemptBrightnessRestore() -> Bool {
     var displayRestored = Set<UInt32>()
     for (id, state) in displayStates {
       guard abs(state.current - state.original) > 0.0005 else {
@@ -732,17 +771,48 @@ final class LidBrightnessController: LidBrightnessControlling {
       keyboardStates.removeValue(forKey: id)
     }
 
+    return displayStates.isEmpty && keyboardStates.isEmpty
+  }
+
+  private func restoreBrightness(stopping: Bool = true) {
+    let restored = attemptBrightnessRestore()
+
     timer?.invalidate()
     timer = nil
     if stopping {
       angleSensor.stopMonitoring()
     }
 
-    if displayStates.isEmpty && keyboardStates.isEmpty {
+    if restored {
       cancelRestoreRetry(resetAttempt: true)
     } else {
       scheduleRestoreRetry()
     }
+  }
+
+  private func performShutdownRestore() async -> BrightnessRestoreResult {
+    for attempt in 0...Self.restoreRetryDelays.count {
+      timer?.invalidate()
+      timer = nil
+      if attemptBrightnessRestore() {
+        cancelRestoreRetry(resetAttempt: true)
+        return .restored
+      }
+
+      guard attempt < Self.restoreRetryDelays.count else {
+        NSLog("Codexetine bounded brightness restoration retries exhausted")
+        return .exhausted
+      }
+
+      do {
+        try await Task.sleep(for: .seconds(Self.restoreRetryDelays[attempt]))
+      } catch {
+        // Shutdown still has to release sleep protection even if the bounded
+        // restore task is canceled by the host.
+        return .exhausted
+      }
+    }
+    return .exhausted
   }
 
   private func scheduleRestoreRetry() {

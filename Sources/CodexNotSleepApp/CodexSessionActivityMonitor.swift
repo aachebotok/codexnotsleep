@@ -141,12 +141,15 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
   )
   private let queueKey = DispatchSpecificKey<UInt8>()
   private let queueToken: UInt8 = 1
+  private let createStreamOverride: (() -> Bool)?
   private let startStreamOverride: (() -> Bool)?
   private let stopStreamOverride: (() -> Void)?
+  private let releaseStreamOverride: (() -> Void)?
   private let retryDelays: [TimeInterval]
   private var pendingChanges = CodexSessionFileChanges()
   private var callbackCount = 0
   private var stream: FSEventStreamRef?
+  private var streamExists = false
   private var changeHandler: (@Sendable () -> Void)?
   private var isStarted = false
   private var wantsMonitoring = false
@@ -159,17 +162,20 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
   init(
     sessionRoot: URL,
     configuration: FSEventsObserverConfiguration = .current,
+    createStream: (() -> Bool)? = nil,
     startStream: (() -> Bool)? = nil,
     stopStream: (() -> Void)? = nil,
+    releaseStream: (() -> Void)? = nil,
     retryDelays: [TimeInterval] = FSEventsCodexSessionFileChangeObserver.defaultRetryDelays
   ) {
     self.sessionRoot = sessionRoot
     self.configuration = configuration
+    createStreamOverride = createStream
     startStreamOverride = startStream
     stopStreamOverride = stopStream
+    releaseStreamOverride = releaseStream
     self.retryDelays = retryDelays.isEmpty ? Self.defaultRetryDelays : retryDelays
     queue.setSpecific(key: queueKey, value: queueToken)
-    queue.sync { createStreamLocked() }
   }
 
   var isEventSourceHealthy: Bool {
@@ -183,8 +189,23 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
     return queue.sync(execute: body)
   }
 
-  private func createStreamLocked() {
-    guard startStreamOverride == nil else { return }
+  @discardableResult
+  private func createStreamLocked() -> Bool {
+    guard !streamExists else { return true }
+    if let createStreamOverride {
+      guard createStreamOverride() else { return false }
+      streamExists = true
+      return true
+    }
+
+    // The start/stop overrides are a compatibility seam for tests that only
+    // model startability. The lifecycle tests use createStream as well so the
+    // production create → start → stop → release path remains exercised.
+    if startStreamOverride != nil {
+      streamExists = true
+      return true
+    }
+
     var context = FSEventStreamContext(
       version: 0,
       info: Unmanaged.passUnretained(self).toOpaque(),
@@ -210,9 +231,10 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
     )
     if let stream {
       FSEventStreamSetDispatchQueue(stream, queue)
-    } else {
-      markStartFailureLocked()
+      streamExists = true
+      return true
     }
+    return false
   }
 
   deinit {
@@ -228,6 +250,9 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
       changeHandler = onChange
       wantsMonitoring = true
       guard !isStarted else { return }
+      // A retry already owns the next start attempt. Repeated refreshes or
+      // callbacks must not bypass its backoff and create a start storm.
+      guard retryWorkItem == nil else { return }
       if retryWorkItem == nil, retryAttempt >= retryDelays.count {
         retryAttempt = 0
       }
@@ -293,19 +318,16 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
 
   private func restartStreamLocked() {
     guard wantsMonitoring else { return }
-    if let stream {
-      FSEventStreamStop(stream)
-      FSEventStreamInvalidate(stream)
-      FSEventStreamRelease(stream)
-      self.stream = nil
-    }
-    if startStreamOverride == nil { createStreamLocked() }
-    isStarted = false
+    disposeStreamLocked()
     startStreamLocked()
   }
 
   private func startStreamLocked() {
     guard wantsMonitoring, !isStarted else { return }
+    guard createStreamLocked() else {
+      markStartFailureLocked()
+      return
+    }
     let didStart: Bool
     if let startStreamOverride {
       didStart = startStreamOverride()
@@ -357,6 +379,20 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
   private func disposeLocked(clearPendingChanges: Bool = true) {
     wantsMonitoring = false
     cancelRetryLocked()
+    disposeStreamLocked()
+    eventSourceHealthy = true
+    retryAttempt = 0
+    changeHandler = nil
+    if clearPendingChanges {
+      pendingChanges = CodexSessionFileChanges()
+    }
+  }
+
+  private func disposeStreamLocked() {
+    guard streamExists || stream != nil else {
+      isStarted = false
+      return
+    }
     if let stream {
       if isStarted { FSEventStreamStop(stream) }
       FSEventStreamInvalidate(stream)
@@ -364,13 +400,9 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
       self.stream = nil
     }
     stopStreamOverride?()
+    releaseStreamOverride?()
+    streamExists = false
     isStarted = false
-    eventSourceHealthy = true
-    retryAttempt = 0
-    changeHandler = nil
-    if clearPendingChanges {
-      pendingChanges = CodexSessionFileChanges()
-    }
   }
 
   private static let callback: FSEventStreamCallback = {

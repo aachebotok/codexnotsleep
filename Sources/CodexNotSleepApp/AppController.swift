@@ -44,6 +44,8 @@ final class AppController: NSObject {
   private var started = false
   private var recoveryPending = false
   private var closedLidPreferenceNeedsMigration = false
+  private var quitInProgress = false
+  private var pendingClosedLidReleaseAfterRepair = false
 
   override convenience init() {
     self.init(startsAutomatically: true)
@@ -230,6 +232,8 @@ final class AppController: NSObject {
       enableClosedLidProtection()
     case .sleepRestoreRequired:
       restoreSleepFromMenu()
+    case .closedLidSetupRepairRequired:
+      repairClosedLidSupport()
     case .closedLidRecoveryRequired:
       restoreClosedLidFromMenu()
     }
@@ -248,16 +252,26 @@ final class AppController: NSObject {
   /// terminates; otherwise a failed restore remains visible and recoverable.
   func quit() {
     graceDeadlineScheduler.cancel()
+    guard !quitInProgress else { return }
     guard started else {
       NSApplication.shared.terminate(nil)
       return
     }
 
+    quitInProgress = true
     batteryStatusProvider.stopMonitoring()
     activityWorker.stop()
     activityWorker.reset()
-    lidBrightnessController.reset()
+    lidBrightnessController.restoreForShutdown { [weak self] result in
+      guard let self else { return }
+      if result == .exhausted {
+        NSLog("Codexetine bounded brightness restoration exhausted before quit")
+      }
+      releaseForQuit()
+    }
+  }
 
+  private func releaseForQuit() {
     if usesBackgroundSystemWork {
       backendOperationInFlight = true
       backendWorker.release { [weak self] result in
@@ -310,7 +324,10 @@ final class AppController: NSObject {
       if error is ClosedLidProtectionError {
         recoveryPending = false
         backendHeld = backend.isHeld
-        menuIssue = .closedLidRecoveryRequired
+        if isClosedLidSetupRequired(error) {
+          pendingClosedLidReleaseAfterRepair = true
+        }
+        menuIssue = menuIssue(for: error)
         if isProtectionEnabled { startActivityMonitoring() }
         requestEvaluation()
         logHiddenError("recover optional closed-lid protection", error: error)
@@ -458,30 +475,87 @@ final class AppController: NSObject {
   }
 
   private func enableClosedLidProtection() {
+    configureClosedLidSupport(onFailure: .permissionRequired)
+  }
+
+  private func repairClosedLidSupport() {
+    configureClosedLidSupport(onFailure: .closedLidSetupRepairRequired)
+  }
+
+  private func configureClosedLidSupport(onFailure: MenuIssue) {
     guard let closedLidProtection, !isPreparingClosedLid else { return }
     isPreparingClosedLid = true
     menuIssue = nil
-    let finish: @MainActor @Sendable (Result<Void, Error>) -> Void = { [weak self] result in
+
+    let fail: @MainActor @Sendable (Error) -> Void = { [weak self] error in
       guard let self else { return }
-      switch result {
-      case .success:
-        setClosedLidMode(true)
-      case .failure(let error):
-        isPreparingClosedLid = false
-        menuIssue = .permissionRequired
-        logHiddenError("configure closed-lid protection", error: error)
+      isPreparingClosedLid = false
+      menuIssue = onFailure
+      logHiddenError("configure closed-lid protection", error: error)
+    }
+
+    let finish: @MainActor @Sendable (PowerProtectSetupState) -> Void = { [weak self] state in
+      guard let self else { return }
+      if state == .installedAndValid {
+        finishClosedLidConfiguration()
+        return
+      }
+
+      let prepared: @MainActor @Sendable (Result<Void, Error>) -> Void = { [weak self] result in
+        guard let self else { return }
+        switch result {
+        case .success:
+          inspectClosedLidSetup { [weak self] finalState in
+            guard let self else { return }
+            guard finalState == .installedAndValid else {
+              fail(PowerProtectError.setupVerificationFailed)
+              return
+            }
+            finishClosedLidConfiguration()
+          }
+        case .failure(let error):
+          fail(error)
+        }
+      }
+
+      if usesBackgroundSystemWork {
+        backendWorker.prepareClosedLid(completion: prepared)
+      } else {
+        do {
+          try closedLidProtection.prepareClosedLid()
+          prepared(.success(()))
+        } catch {
+          prepared(.failure(error))
+        }
       }
     }
 
+    inspectClosedLidSetup(completion: finish)
+  }
+
+  private func finishClosedLidConfiguration() {
+    guard pendingClosedLidReleaseAfterRepair else {
+      setClosedLidMode(true)
+      return
+    }
+
+    pendingClosedLidReleaseAfterRepair = false
+    isPreparingClosedLid = false
+    // This is a targeted optional-layer release after setup repair. It must
+    // not route through CombinedSleepProtectionBackend.release(), which would
+    // also perform a generic mandatory-layer rollback.
+    restoreClosedLidFromMenu()
+  }
+
+  private func inspectClosedLidSetup(
+    completion: @escaping @MainActor @Sendable (PowerProtectSetupState) -> Void
+  ) {
     if usesBackgroundSystemWork {
-      backendWorker.prepareClosedLid(completion: finish)
+      backendWorker.inspectClosedLidSetup(completion: completion)
     } else {
-      do {
-        try closedLidProtection.prepareClosedLid()
-        finish(.success(()))
-      } catch {
-        finish(.failure(error))
-      }
+      completion(
+        (backend as? any ClosedLidProtectionInspecting)?.closedLidSetupState ?? .unavailable
+      )
     }
   }
 
@@ -637,9 +711,12 @@ final class AppController: NSObject {
     case .failure(let error):
       if operation == .release {
         backendHeld = backend.isHeld
+        if isClosedLidSetupRequired(error) {
+          pendingClosedLidReleaseAfterRepair = true
+        }
         menuIssue =
           error is ClosedLidProtectionError
-          ? .closedLidRecoveryRequired
+          ? menuIssue(for: error)
           : .sleepRestoreRequired
         logHiddenError("restore sleep", error: error)
       } else if error is ClosedLidProtectionError {
@@ -647,7 +724,7 @@ final class AppController: NSObject {
         // layer fails. Keep evaluating it and surface only the optional issue.
         backendHeld = true
         lastBackendRenewAt = now()
-        menuIssue = .closedLidRecoveryRequired
+        menuIssue = menuIssue(for: error)
         logHiddenError("activate optional closed-lid protection", error: error)
       } else {
         let activationIssue: MenuIssue? =
@@ -713,7 +790,10 @@ final class AppController: NSObject {
           requestEvaluation()
         }
       case .failure(let error):
-        menuIssue = .closedLidRecoveryRequired
+        if isClosedLidSetupRequired(error) {
+          pendingClosedLidReleaseAfterRepair = true
+        }
+        menuIssue = menuIssue(for: error)
         logHiddenError("restore closed-lid protection from menu", error: error)
       }
     }
@@ -751,7 +831,7 @@ final class AppController: NSObject {
       pendingActivationIssue = nil
       menuIssue =
         error is ClosedLidProtectionError
-        ? .closedLidRecoveryRequired
+        ? menuIssue(for: error)
         : .sleepRestoreRequired
       logHiddenError("restore sleep from menu", error: error)
     }
@@ -781,12 +861,16 @@ final class AppController: NSObject {
   }
 
   private func handleFailedQuit(_ error: Error) {
+    quitInProgress = false
     backendOperationInFlight = false
     recoveryPending = false
     backendHeld = backend.isHeld
+    if isClosedLidSetupRequired(error) {
+      pendingClosedLidReleaseAfterRepair = true
+    }
     menuIssue =
       error is ClosedLidProtectionError
-      ? .closedLidRecoveryRequired
+      ? menuIssue(for: error)
       : .sleepRestoreRequired
 
     // A failed quit is recoverable while the app remains alive. Re-arm every
@@ -806,6 +890,17 @@ final class AppController: NSObject {
     NSLog("Codexetine failed to %@: %@", operation, error.localizedDescription)
   }
 
+  private func menuIssue(for error: Error) -> MenuIssue {
+    if isClosedLidSetupRequired(error) {
+      return .closedLidSetupRepairRequired
+    }
+    return .closedLidRecoveryRequired
+  }
+
+  private func isClosedLidSetupRequired(_ error: Error) -> Bool {
+    (error as? ClosedLidProtectionError) == .setupRequired
+  }
+
   @objc
   private func applicationWillTerminate() {
     shutdown()
@@ -818,12 +913,17 @@ final class AppController: NSObject {
     batteryStatusProvider.stopMonitoring()
     activityWorker.stop()
     activityWorker.reset()
-    lidBrightnessController.reset()
     removeTerminationObserver()
-    if usesBackgroundSystemWork {
-      backendWorker.release { _ in }
-    } else {
-      try? backend.release()
+    lidBrightnessController.restoreForShutdown { [weak self] result in
+      guard let self else { return }
+      if result == .exhausted {
+        NSLog("Codexetine bounded brightness restoration exhausted during shutdown")
+      }
+      if usesBackgroundSystemWork {
+        backendWorker.release { _ in }
+      } else {
+        try? backend.release()
+      }
     }
   }
 

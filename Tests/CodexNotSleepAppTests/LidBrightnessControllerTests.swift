@@ -337,6 +337,88 @@ struct LidBrightnessControllerTests {
   }
 
   @Test
+  func shutdownRestoreCompletesAfterImmediateSuccessAndCancelsResources() async {
+    let sensor = TestLidAngleSensor(angle: 25)
+    let display = TestDisplayBrightnessProvider(brightness: 0.8)
+    let keyboard = TestKeyboardBacklightProvider(brightness: 0.7)
+    let controller = LidBrightnessController(
+      angleSensor: sensor,
+      displayProvider: display,
+      keyboardProvider: keyboard,
+      schedulesTimer: true
+    )
+    controller.setCodexWorking(true)
+    let start = Date()
+    controller.refreshBrightness(at: start)
+    controller.refreshBrightness(
+      at: start.addingTimeInterval(LidBrightnessController.transitionDuration)
+    )
+
+    let result = await shutdownRestore(controller)
+
+    #expect(result == .restored)
+    #expect(display.brightness == 0.8)
+    #expect(keyboard.brightness == 0.7)
+    #expect(!controller.isInterpolationTimerActive)
+    #expect(!controller.isRestoreRetryScheduled)
+  }
+
+  @Test
+  func shutdownRestoreKeepsDisplayIndependentFromDelayedKeyboardRecovery() async {
+    let sensor = TestLidAngleSensor(angle: 25)
+    let display = TestDisplayBrightnessProvider(brightness: 0.8)
+    let keyboard = TestKeyboardBacklightProvider(brightness: 0.7)
+    let controller = LidBrightnessController(
+      angleSensor: sensor,
+      displayProvider: display,
+      keyboardProvider: keyboard,
+      schedulesTimer: false
+    )
+    controller.setCodexWorking(true)
+    let start = Date()
+    controller.refreshBrightness(at: start)
+    controller.refreshBrightness(
+      at: start.addingTimeInterval(LidBrightnessController.transitionDuration)
+    )
+    keyboard.failNextWrite = true
+
+    let result = await shutdownRestore(controller)
+
+    #expect(result == .restored)
+    #expect(display.brightness == 0.8)
+    #expect(keyboard.brightness == 0.7)
+    #expect(!controller.isRestoreRetryScheduled)
+  }
+
+  @Test
+  func shutdownRestoreExhaustionIsFiniteAndLeavesNoRetryTask() async {
+    let sensor = TestLidAngleSensor(angle: 25)
+    let display = TestDisplayBrightnessProvider(brightness: 0.8)
+    let keyboard = TestKeyboardBacklightProvider(brightness: 0.7)
+    let controller = LidBrightnessController(
+      angleSensor: sensor,
+      displayProvider: display,
+      keyboardProvider: keyboard,
+      schedulesTimer: true
+    )
+    controller.setCodexWorking(true)
+    let start = Date()
+    controller.refreshBrightness(at: start)
+    controller.refreshBrightness(
+      at: start.addingTimeInterval(LidBrightnessController.transitionDuration)
+    )
+    keyboard.failAllWrites = true
+
+    let result = await shutdownRestore(controller)
+
+    #expect(result == .exhausted)
+    #expect(display.brightness == 0.8)
+    #expect(keyboard.brightness != 0.7)
+    #expect(!controller.isInterpolationTimerActive)
+    #expect(!controller.isRestoreRetryScheduled)
+  }
+
+  @Test
   func controllerDimsOnlyForConfirmedActiveCodexWork() {
     let suiteName = "CodexNotSleep.LidBrightnessTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!
@@ -367,6 +449,16 @@ struct LidBrightnessControllerTests {
 
     controller.setProtectionEnabled(false)
     #expect(brightness.events.last == false)
+  }
+
+  private func shutdownRestore(
+    _ controller: LidBrightnessController
+  ) async -> BrightnessRestoreResult {
+    await withCheckedContinuation { continuation in
+      controller.restoreForShutdown { result in
+        continuation.resume(returning: result)
+      }
+    }
   }
 }
 

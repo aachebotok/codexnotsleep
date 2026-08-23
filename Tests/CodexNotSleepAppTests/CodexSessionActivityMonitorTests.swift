@@ -882,12 +882,19 @@ struct CodexSessionActivityMonitorTests {
     let stops = LockedCounter()
     let observer = FSEventsCodexSessionFileChangeObserver(
       sessionRoot: fixture.directory,
+      createStream: {
+        true
+      },
       startStream: {
         let attempt = starts.increment()
         return attempt >= 3
       },
       stopStream: {
         stops.increment()
+      },
+      releaseStream: {
+        // The stop counter above covers the logical stop; this closure keeps
+        // the injected lifecycle's release phase explicit.
       },
       retryDelays: [0.01, 0.01, 0.01]
     )
@@ -913,12 +920,25 @@ struct CodexSessionActivityMonitorTests {
   @Test
   func eventSourceCanRestartAfterACompletedStop() async throws {
     let fixture = try SessionFixture()
+    let creates = LockedCounter()
     let starts = LockedCounter()
+    let stops = LockedCounter()
+    let releases = LockedCounter()
     let observer = FSEventsCodexSessionFileChangeObserver(
       sessionRoot: fixture.directory,
+      createStream: {
+        creates.increment()
+        return true
+      },
       startStream: {
         starts.increment()
         return true
+      },
+      stopStream: {
+        stops.increment()
+      },
+      releaseStream: {
+        releases.increment()
       },
       retryDelays: [0.01]
     )
@@ -928,10 +948,13 @@ struct CodexSessionActivityMonitorTests {
     observer.stop()
     observer.start {}
     try await Task.sleep(for: .milliseconds(10))
-
-    #expect(starts.value == 2)
-    #expect(observer.isEventSourceHealthy)
     observer.stop()
+
+    #expect(creates.value == 2)
+    #expect(starts.value == 2)
+    #expect(stops.value == 2)
+    #expect(releases.value == 2)
+    #expect(observer.isEventSourceHealthy)
   }
 
   @Test

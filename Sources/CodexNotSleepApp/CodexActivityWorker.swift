@@ -20,7 +20,6 @@ final class CodexActivityWorker: @unchecked Sendable {
   private var isStarted = false
   private var refreshScheduled = false
   private var snapshotHandler: (@MainActor @Sendable (CodexActivitySnapshot) -> Void)?
-  private var eventSourceHandler: (@Sendable () -> Void)?
   private(set) var lastScheduledReconciliationInterval: TimeInterval?
 
   init(provider: any CodexActivityProviding) {
@@ -42,7 +41,6 @@ final class CodexActivityWorker: @unchecked Sendable {
       let eventSourceHandler: @Sendable () -> Void = { [weak self] in
         self?.requestRefresh()
       }
-      self.eventSourceHandler = eventSourceHandler
       self.provider.startMonitoring(onChange: eventSourceHandler)
 
       let timer = DispatchSource.makeTimerSource(queue: self.queue)
@@ -78,7 +76,6 @@ final class CodexActivityWorker: @unchecked Sendable {
       self.provider.stopMonitoring()
       self.refreshScheduled = false
       self.snapshotHandler = nil
-      self.eventSourceHandler = nil
       self.lastScheduledReconciliationInterval = nil
     }
   }
@@ -93,9 +90,6 @@ final class CodexActivityWorker: @unchecked Sendable {
       if self.provider.hasPendingWork {
         self.provider.requestPendingWorkContinuation()
         self.scheduleRefresh()
-      }
-      if !self.provider.isEventSourceHealthy, let eventSourceHandler = self.eventSourceHandler {
-        self.provider.startMonitoring(onChange: eventSourceHandler)
       }
       self.scheduleReconciliation(for: snapshot)
       guard let snapshotHandler = self.snapshotHandler else { return }

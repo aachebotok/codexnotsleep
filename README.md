@@ -18,6 +18,16 @@
 
 Download the latest `.dmg`, open it, and drag **Codexetine** to the Applications folder.
 
+### Upgrading from Codex Not Sleep
+
+Codexetine keeps the historical bundle identifier so existing preferences and
+login-item registration can continue to work. If **/Applications/Codex Not Sleep.app**
+is still present, the first launch of the installed Codexetine app shows a
+native migration prompt. Choose **Move Old App to Trash** only after confirming
+the old copy is no longer running; **Later** leaves it untouched. The migration
+does not remove preferences, closed-lid leases, sudoers configuration, or the
+current Codexetine login item.
+
 ### If macOS blocks the app
 
 The current release is locally signed but not notarized by Apple, so Gatekeeper may show a message saying that Apple could not verify the app for malicious software. To open it:
