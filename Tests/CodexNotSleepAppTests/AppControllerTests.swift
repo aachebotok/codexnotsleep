@@ -335,9 +335,206 @@ struct AppControllerTests {
     #expect(backend.releaseCount == 1)
   }
 
+  @Test
+  func optionalClosedLidFailureKeepsOrdinaryProtectionHeld() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+
+    let idle = TestControllerIOPMBackend()
+    let closedLid = TestControllerClosedLidBackend(enabled: true)
+    closedLid.failAcquire = true
+    let backend = CombinedSleepProtectionBackend(idleSleep: idle, closedLid: closedLid)
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: TestCodexActivityProvider(snapshot: .active(turnCount: 1)),
+      protectionGraceSeconds: 0,
+      startsAutomatically: false
+    )
+
+    controller.refreshCodexActivity()
+
+    #expect(idle.isHeld)
+    #expect(controller.menuIssue == .closedLidRecoveryRequired)
+    #expect(controller.isProtectionEnabled)
+  }
+
+  @Test
+  func disablingClosedLidKeepsOrdinaryIOPMProtection() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+    defaults.set(true, forKey: ProtectionPreferenceStore.closedLidKey)
+
+    let idle = TestControllerIOPMBackend()
+    let closedLid = TestControllerClosedLidBackend(enabled: true)
+    let backend = CombinedSleepProtectionBackend(idleSleep: idle, closedLid: closedLid)
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: TestCodexActivityProvider(snapshot: .active(turnCount: 1)),
+      protectionGraceSeconds: 0,
+      startsAutomatically: false
+    )
+
+    controller.refreshCodexActivity()
+    #expect(idle.isHeld)
+    #expect(closedLid.isHeld)
+
+    controller.toggleClosedLidProtection()
+
+    #expect(!controller.isClosedLidEnabled)
+    #expect(idle.isHeld)
+    #expect(!closedLid.isHeld)
+    #expect(controller.menuIssue == nil)
+  }
+
+  @Test
+  func failedClosedLidSetupLeavesItemUncheckedAndIOPMUsable() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+    defaults.set(false, forKey: ProtectionPreferenceStore.closedLidKey)
+
+    let idle = TestControllerIOPMBackend()
+    let closedLid = TestControllerClosedLidBackend(enabled: false)
+    closedLid.failPrepare = true
+    let backend = CombinedSleepProtectionBackend(idleSleep: idle, closedLid: closedLid)
+    let activity = TestCodexActivityProvider(snapshot: .active(turnCount: 1))
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
+      startsAutomatically: false
+    )
+
+    controller.toggleClosedLidProtection()
+
+    #expect(!controller.isClosedLidEnabled)
+    #expect(controller.menuIssue == .permissionRequired)
+    controller.refreshCodexActivity()
+    #expect(idle.isHeld)
+  }
+
+  @Test
+  func ordinaryRecoveryDoesNotPrepareOptionalClosedLidSetup() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+
+    let idle = TestControllerIOPMBackend()
+    let closedLid = TestControllerClosedLidBackend(enabled: false)
+    let backend = CombinedSleepProtectionBackend(idleSleep: idle, closedLid: closedLid)
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: TestCodexActivityProvider(snapshot: .active(turnCount: 1)),
+      protectionGraceSeconds: 0,
+      startsAutomatically: false
+    )
+    controller.refreshCodexActivity()
+    idle.failNextRelease = true
+    controller.setProtectionEnabled(false)
+    #expect(controller.menuIssue == .sleepRestoreRequired)
+
+    controller.resolveMenuIssue()
+
+    #expect(closedLid.prepareCount == 0)
+    #expect(controller.menuIssue == nil)
+  }
+
+  @Test
+  func failedQuitRearmsMonitoringAndBatteryCallbacks() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+
+    let backend = TestSleepProtectionBackend()
+    let battery = TestBatteryStatusProvider(status: nil)
+    let activity = TestCodexActivityProvider(snapshot: .active(turnCount: 1))
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      batteryStatusProvider: battery,
+      codexActivityProvider: activity,
+      protectionGraceSeconds: 0,
+      startsAutomatically: false
+    )
+    controller.start()
+    controller.refreshCodexActivity()
+    backend.failNextRelease = true
+
+    controller.quit()
+
+    #expect(controller.menuIssue == .sleepRestoreRequired)
+    #expect(battery.startCount >= 2)
+    #expect(battery.stopCount == 1)
+    #expect(activity.startMonitoringCount >= 2)
+    #expect(activity.stopMonitoringCount == 1)
+  }
+
+  @Test
+  func closedLidPreferenceMigratesOnlyWhenTheNewKeyIsAbsent() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+    let backend = TestControllerClosedLidBackend(
+      enabled: false,
+      setupState: .installedAndValid
+    )
+
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: TestCodexActivityProvider(snapshot: .idle),
+      startsAutomatically: false
+    )
+    controller.start()
+
+    #expect(defaults.bool(forKey: ProtectionPreferenceStore.closedLidKey))
+    #expect(controller.isClosedLidEnabled)
+    #expect(backend.setupInspectionCount == 1)
+
+    let explicitDefaults = try makeDefaults()
+    defer { explicitDefaults.removePersistentDomain(forName: defaultsSuiteName(explicitDefaults)) }
+    explicitDefaults.set(false, forKey: ProtectionPreferenceStore.closedLidKey)
+    let explicitBackend = TestControllerClosedLidBackend(
+      enabled: false,
+      setupState: .installedAndValid
+    )
+    let explicitController = AppController(
+      defaults: explicitDefaults,
+      backend: explicitBackend,
+      codexActivityProvider: TestCodexActivityProvider(snapshot: .idle),
+      startsAutomatically: false
+    )
+    explicitController.start()
+
+    #expect(!explicitDefaults.bool(forKey: ProtectionPreferenceStore.closedLidKey))
+    #expect(explicitBackend.setupInspectionCount == 0)
+  }
+
+  @Test
+  func closedLidMenuTitleIsStableAndCheckableByState() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    let backend = TestControllerClosedLidBackend(enabled: false)
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: TestCodexActivityProvider(snapshot: .idle),
+      startsAutomatically: false
+    )
+
+    #expect(controller.closedLidMenuTitle == "Keep Awake with Lid Closed")
+    #expect(!controller.isClosedLidEnabled)
+  }
+
   private func makeController(
     defaults: UserDefaults,
-    backend: TestSleepProtectionBackend,
+    backend: any SleepProtectionBackend,
     battery: TestBatteryStatusProvider = TestBatteryStatusProvider(status: nil),
     activity: TestCodexActivityProvider,
     graceSeconds: TimeInterval,
@@ -420,6 +617,72 @@ private final class TestSleepProtectionBackend: SleepProtectionBackend {
   }
 }
 
+private final class TestControllerIOPMBackend: SleepProtectionBackend {
+  let identifier = "controller-iopm-test"
+  private(set) var isHeld = false
+  var failNextRelease = false
+
+  func acquire() throws { isHeld = true }
+  func renew() throws {}
+  func release() throws {
+    if failNextRelease {
+      failNextRelease = false
+      throw TestBackendError.release
+    }
+    isHeld = false
+  }
+}
+
+private final class TestControllerClosedLidBackend:
+  SleepProtectionBackend,
+  ClosedLidProtectionManaging,
+  ClosedLidProtectionInspecting,
+  ClosedLidProtectionReleasing
+{
+  let identifier = "controller-closed-lid-test"
+  private(set) var isHeld = false
+  private(set) var isClosedLidEnabled: Bool
+  private(set) var prepareCount = 0
+  private(set) var setupInspectionCount = 0
+  let setupState: PowerProtectSetupState
+  var failAcquire = false
+  var failPrepare = false
+
+  init(enabled: Bool, setupState: PowerProtectSetupState = .installedAndValid) {
+    isClosedLidEnabled = enabled
+    self.setupState = setupState
+  }
+
+  var requiresSetup: Bool { false }
+
+  func prepare() throws { try prepareClosedLid() }
+
+  func prepareClosedLid() throws {
+    prepareCount += 1
+    if failPrepare { throw TestBackendError.setup }
+  }
+
+  func setClosedLidEnabled(_ enabled: Bool) {
+    isClosedLidEnabled = enabled
+  }
+
+  var closedLidSetupState: PowerProtectSetupState {
+    setupInspectionCount += 1
+    return setupState
+  }
+
+  func recover() throws {}
+
+  func acquire() throws {
+    if failAcquire { throw TestBackendError.setup }
+    isHeld = true
+  }
+
+  func renew() throws {}
+  func release() throws { isHeld = false }
+  func releaseClosedLid() throws { try release() }
+}
+
 private enum TestBackendError: Error {
   case setup
   case recovery
@@ -428,6 +691,8 @@ private enum TestBackendError: Error {
 
 private final class TestBatteryStatusProvider: BatteryStatusProviding, @unchecked Sendable {
   var status: BatteryStatus?
+  private(set) var startCount = 0
+  private(set) var stopCount = 0
 
   init(status: BatteryStatus?) {
     self.status = status
@@ -435,6 +700,14 @@ private final class TestBatteryStatusProvider: BatteryStatusProviding, @unchecke
 
   func currentStatus() -> BatteryStatus? {
     status
+  }
+
+  func startMonitoring(onChange: @escaping @Sendable () -> Void) {
+    startCount += 1
+  }
+
+  func stopMonitoring() {
+    stopCount += 1
   }
 }
 
@@ -469,6 +742,7 @@ private final class TestCodexActivityProvider: CodexActivityProviding {
   var snapshot: CodexActivitySnapshot
   private(set) var refreshCount = 0
   private(set) var startMonitoringCount = 0
+  private(set) var stopMonitoringCount = 0
 
   init(snapshot: CodexActivitySnapshot) {
     self.snapshot = snapshot
@@ -481,5 +755,9 @@ private final class TestCodexActivityProvider: CodexActivityProviding {
 
   func startMonitoring(onChange: @escaping @Sendable () -> Void) {
     startMonitoringCount += 1
+  }
+
+  func stopMonitoring() {
+    stopMonitoringCount += 1
   }
 }

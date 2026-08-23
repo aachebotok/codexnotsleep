@@ -77,27 +77,27 @@ struct LaunchAtLoginControllerTests {
     let home = URL(filePath: "/Users/tester")
     #expect(
       LaunchAtLoginController.isEligibleAppPath(
-        URL(filePath: "/Applications/Codex Not Sleep.app"),
+        URL(filePath: "/Applications/Codexetine.app"),
         homeDirectory: home
       ))
     #expect(
       LaunchAtLoginController.isEligibleAppPath(
-        URL(filePath: "/Users/tester/Applications/Codex Not Sleep.app"),
+        URL(filePath: "/Users/tester/Applications/Codexetine.app"),
         homeDirectory: home
       ))
     #expect(
       !LaunchAtLoginController.isEligibleAppPath(
-        URL(filePath: "/Users/tester/Documents/cns/dist/Codex Not Sleep.app"),
+        URL(filePath: "/Users/tester/Documents/cns/dist/Codexetine.app"),
         homeDirectory: home
       ))
     #expect(
       !LaunchAtLoginController.isEligibleAppPath(
-        URL(filePath: "/Users/tester/Downloads/Codex Not Sleep.app"),
+        URL(filePath: "/Users/tester/Downloads/Codexetine.app"),
         homeDirectory: home
       ))
     #expect(
       !LaunchAtLoginController.isEligibleAppPath(
-        URL(filePath: "/Volumes/Codex Not Sleep/Codex Not Sleep.app"),
+        URL(filePath: "/Volumes/Codexetine/Codexetine.app"),
         homeDirectory: home
       ))
   }

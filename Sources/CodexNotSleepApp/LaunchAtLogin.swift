@@ -60,16 +60,16 @@ final class LaunchAtLoginController: LaunchAtLoginControlling {
 
   func enableByDefault() -> String? {
     guard canRegisterCurrentApp() else {
-      NSLog("Codex Not Sleep skipped launch-at-login registration outside a writable app bundle")
+      NSLog("Codexetine skipped launch-at-login registration outside a writable app bundle")
       return nil
     }
 
     switch service.status {
     case .enabled:
-      NSLog("Codex Not Sleep launch at login is already enabled")
+      NSLog("Codexetine launch at login is already enabled")
       return nil
     case .requiresApproval:
-      NSLog("Codex Not Sleep launch at login requires user approval")
+      NSLog("Codexetine launch at login requires user approval")
       return nil
     case .notRegistered, .notFound:
       break
@@ -79,7 +79,7 @@ final class LaunchAtLoginController: LaunchAtLoginControlling {
       try service.register()
     } catch {
       NSLog(
-        "Codex Not Sleep failed to register launch at login (%@): %@",
+        "Codexetine failed to register launch at login (%@): %@",
         String(describing: service.status),
         error.localizedDescription
       )
@@ -93,14 +93,14 @@ final class LaunchAtLoginController: LaunchAtLoginControlling {
 
     switch service.status {
     case .enabled:
-      NSLog("Codex Not Sleep enabled launch at login")
+      NSLog("Codexetine enabled launch at login")
       return nil
     case .requiresApproval:
-      NSLog("Codex Not Sleep launch at login requires user approval")
+      NSLog("Codexetine launch at login requires user approval")
       return nil
     case .notRegistered, .notFound:
       NSLog(
-        "Codex Not Sleep launch-at-login registration finished with status %@",
+        "Codexetine launch-at-login registration finished with status %@",
         String(describing: service.status)
       )
       return Self.failureMessage
@@ -133,6 +133,7 @@ final class LaunchAtLoginController: LaunchAtLoginControlling {
   ) -> Bool {
     let bundleURL = bundleURL.standardizedFileURL
     guard bundleURL.pathExtension == "app" else { return false }
+    guard bundleURL.lastPathComponent == "Codexetine.app" else { return false }
     let allowedRoots = [
       URL(filePath: "/Applications").standardizedFileURL,
       homeDirectory.appending(path: "Applications").standardizedFileURL,

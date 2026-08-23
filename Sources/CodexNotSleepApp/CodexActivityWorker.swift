@@ -7,8 +7,8 @@ import Foundation
 /// recreated session directory; it is not the activity loop.
 // All mutable state and provider access are serialized on `queue`.
 final class CodexActivityWorker: @unchecked Sendable {
-  static let activeReconciliationInterval: TimeInterval = 30
-  static let idleReconciliationInterval: TimeInterval = 5 * 60
+  static let activeReconciliationInterval: TimeInterval = 5 * 60
+  static let idleReconciliationInterval: TimeInterval = 30 * 60
   static let fallbackReconciliationInterval: TimeInterval = 30
 
   private let provider: any CodexActivityProviding
@@ -20,6 +20,7 @@ final class CodexActivityWorker: @unchecked Sendable {
   private var isStarted = false
   private var refreshScheduled = false
   private var snapshotHandler: (@MainActor @Sendable (CodexActivitySnapshot) -> Void)?
+  private var eventSourceHandler: (@Sendable () -> Void)?
   private(set) var lastScheduledReconciliationInterval: TimeInterval?
 
   init(provider: any CodexActivityProviding) {
@@ -38,9 +39,11 @@ final class CodexActivityWorker: @unchecked Sendable {
       }
 
       self.isStarted = true
-      self.provider.startMonitoring { [weak self] in
+      let eventSourceHandler: @Sendable () -> Void = { [weak self] in
         self?.requestRefresh()
       }
+      self.eventSourceHandler = eventSourceHandler
+      self.provider.startMonitoring(onChange: eventSourceHandler)
 
       let timer = DispatchSource.makeTimerSource(queue: self.queue)
       timer.setEventHandler { [weak self] in
@@ -75,6 +78,7 @@ final class CodexActivityWorker: @unchecked Sendable {
       self.provider.stopMonitoring()
       self.refreshScheduled = false
       self.snapshotHandler = nil
+      self.eventSourceHandler = nil
       self.lastScheduledReconciliationInterval = nil
     }
   }
@@ -87,7 +91,11 @@ final class CodexActivityWorker: @unchecked Sendable {
       self.refreshScheduled = false
       let snapshot = self.provider.refresh()
       if self.provider.hasPendingWork {
+        self.provider.requestPendingWorkContinuation()
         self.scheduleRefresh()
+      }
+      if !self.provider.isEventSourceHealthy, let eventSourceHandler = self.eventSourceHandler {
+        self.provider.startMonitoring(onChange: eventSourceHandler)
       }
       self.scheduleReconciliation(for: snapshot)
       guard let snapshotHandler = self.snapshotHandler else { return }
@@ -100,13 +108,17 @@ final class CodexActivityWorker: @unchecked Sendable {
   private func scheduleReconciliation(for snapshot: CodexActivitySnapshot) {
     guard let timer = reconciliationTimer, isStarted else { return }
     let interval: TimeInterval
-    switch snapshot {
-    case .idle:
-      interval = Self.idleReconciliationInterval
-    case .active:
-      interval = Self.activeReconciliationInterval
-    case .unavailable:
+    if !provider.isEventSourceHealthy {
       interval = Self.fallbackReconciliationInterval
+    } else {
+      switch snapshot {
+      case .idle:
+        interval = Self.idleReconciliationInterval
+      case .active:
+        interval = Self.activeReconciliationInterval
+      case .unavailable:
+        interval = Self.fallbackReconciliationInterval
+      }
     }
     lastScheduledReconciliationInterval = interval
     timer.schedule(

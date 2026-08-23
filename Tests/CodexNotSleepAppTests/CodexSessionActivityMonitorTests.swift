@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 
@@ -402,6 +403,27 @@ struct CodexSessionActivityMonitorTests {
 
     #expect(monitor.refresh() == .unavailable(protectConservatively: true))
     currentTime = currentTime.addingTimeInterval(60 * 60)
+    #expect(monitor.refresh() == .unavailable(protectConservatively: false))
+  }
+
+  @Test
+  func positiveLifecycleEvidenceReopensTheBoundedUncertaintyWindow() throws {
+    let fixture = try SessionFixture()
+    let file = try fixture.makeRootSession(events: [start("A")])
+    let locator = FakeCodexOpenSessionLocator(files: [owned(file)])
+    locator.inventory = CodexOpenSessionInventory(
+      hasCodexRuntime: true,
+      files: [owned(file)],
+      isReliable: false
+    )
+    var currentTime = Date(timeIntervalSince1970: 10_000)
+    let monitor = CodexSessionActivityMonitor(locator: locator, now: { currentTime })
+
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+    currentTime = currentTime.addingTimeInterval(60 * 60)
+    #expect(monitor.refresh() == .unavailable(protectConservatively: false))
+
+    try fixture.append(start("B", startedAt: 10_000), to: file)
     #expect(monitor.refresh() == .unavailable(protectConservatively: true))
   }
 
@@ -498,6 +520,28 @@ struct CodexSessionActivityMonitorTests {
     #expect(monitor.refresh() == .unavailable(protectConservatively: true))
     #expect(!monitor.hasPendingWork)
     #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+  }
+
+  @Test
+  func bootstrapReconstructsLifecycleLinesAcrossReverseChunkBoundaries() throws {
+    for paddingBytes in [8 * 1_024, 32 * 1_024, 64 * 1_024 - 128] {
+      let fixture = try SessionFixture()
+      let event = paddedStart("boundary", paddingBytes: paddingBytes)
+      let metadata =
+        #"{"type":"session_meta","payload":{"id":"root","thread_source":"user"}}"# + "\n"
+      let prefixLength = max(
+        3,
+        (64 * 1_024 - event.utf8.count / 2 - metadata.utf8.count) / 3
+      )
+      let file = fixture.directory.appending(path: "boundary-\(paddingBytes).jsonl")
+      try Data((metadata + String(repeating: "{}\n", count: prefixLength) + event).utf8)
+        .write(to: file)
+      let monitor = CodexSessionActivityMonitor(
+        locator: FakeCodexOpenSessionLocator(files: [owned(file)])
+      )
+
+      #expect(monitor.refresh() == .active(turnCount: 1))
+    }
   }
 
   @Test
@@ -679,13 +723,57 @@ struct CodexSessionActivityMonitorTests {
   }
 
   @Test
+  func knownSessionBacklogContinuationAvoidsGlobalInventoryScans() throws {
+    let fixture = try SessionFixture()
+    let runtimeStartedAt = Date(timeIntervalSince1970: 3_000)
+    let file = try fixture.makeRootSession(events: [start("backlog", startedAt: 3_100)])
+    let observer = FakeCodexSessionFileChangeObserver()
+    let inspector = FakeCodexProcessInspector(
+      processes: [CodexRuntimeProcess(processID: 101, startedAt: runtimeStartedAt)],
+      pathsByProcessID: [101: [file.path]],
+      unreadableProcessIDs: []
+    )
+    let locator = LibprocCodexOpenSessionLocator(
+      sessionRoot: fixture.directory,
+      userID: 501,
+      processInspector: inspector,
+      minimumDiscoveryInterval: 10_000,
+      now: { Date(timeIntervalSince1970: 3_200) },
+      changeObserver: observer
+    )
+    let monitor = CodexSessionActivityMonitor(locator: locator)
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+    let processScans = locator.metrics.processTableScans
+    let descriptorScans = locator.metrics.fileDescriptorScans
+    let append = String(repeating: "{}\n", count: 180_000) + complete("backlog")
+    try fixture.append(append, to: file)
+    observer.changes.paths.insert(file.path)
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+    #expect(monitor.hasPendingWork)
+    #expect(locator.metrics.processTableScans == processScans)
+    #expect(locator.metrics.fileDescriptorScans == descriptorScans)
+
+    for _ in 0..<8 where monitor.hasPendingWork {
+      monitor.requestPendingWorkContinuation()
+      _ = monitor.refresh()
+    }
+
+    #expect(!monitor.hasPendingWork)
+    #expect(monitor.snapshot == .idle)
+    #expect(locator.metrics.processTableScans == processScans)
+    #expect(locator.metrics.fileDescriptorScans == descriptorScans)
+  }
+
+  @Test
   func discoveredSessionCandidatesAndTrackedStateAreBounded() throws {
     let fixture = try SessionFixture()
     let runtimeStartedAt = Date(timeIntervalSince1970: 3_000)
     for index in 0..<400 {
       _ = try fixture.makeRootSession(name: "historical-\(index)", events: [])
     }
-    let active = try fixture.makeRootSession(events: [start("active")])
+    let active = try fixture.makeRootSession(events: [start("active", startedAt: 3_100)])
     try fixture.setModificationDate(Date(timeIntervalSince1970: 9_000), for: active)
     let inspector = FakeCodexProcessInspector(
       processes: [CodexRuntimeProcess(processID: 101, startedAt: runtimeStartedAt)],
@@ -705,6 +793,52 @@ struct CodexSessionActivityMonitorTests {
     #expect(locator.metrics.discoveredPathCount <= 256)
     #expect(monitor.metrics.trackedStateCount <= 256)
     #expect(locator.metrics.discoveredPathCount > 0)
+  }
+
+  @Test
+  func historicalDatePartitionsArePrunedBeforeEnumeration() throws {
+    let fixture = try SessionFixture()
+    let fileManager = FileManager.default
+    let now = Date()
+    let dateComponents = Calendar.current.dateComponents([.year, .month, .day], from: now)
+    let oldPartition = fixture.directory
+      .appending(path: "2020", directoryHint: .isDirectory)
+      .appending(path: "01", directoryHint: .isDirectory)
+      .appending(path: "01", directoryHint: .isDirectory)
+    try fileManager.createDirectory(at: oldPartition, withIntermediateDirectories: true)
+    for index in 0..<2_200 {
+      let url = oldPartition.appending(path: "old-\(index).jsonl")
+      try Data("{}\n".utf8).write(to: url)
+    }
+
+    let currentPartition = fixture.directory
+      .appending(path: String(dateComponents.year!), directoryHint: .isDirectory)
+      .appending(path: String(format: "%02d", dateComponents.month!), directoryHint: .isDirectory)
+      .appending(path: String(format: "%02d", dateComponents.day!), directoryHint: .isDirectory)
+    try fileManager.createDirectory(at: currentPartition, withIntermediateDirectories: true)
+    let active = currentPartition.appending(path: "active.jsonl")
+    try Data(
+      (start("partition", startedAt: Int(now.timeIntervalSince1970 - 30)) + "\n").utf8
+    ).write(to: active)
+
+    let inspector = FakeCodexProcessInspector(
+      processes: [CodexRuntimeProcess(processID: 101, startedAt: now.addingTimeInterval(-60))],
+      pathsByProcessID: [101: []],
+      unreadableProcessIDs: []
+    )
+    let locator = LibprocCodexOpenSessionLocator(
+      sessionRoot: fixture.directory,
+      userID: 501,
+      processInspector: inspector,
+      minimumDiscoveryInterval: 0,
+      now: { now }
+    )
+
+    let inventory = try locator.locateOpenSessions()
+
+    #expect(inventory.files.map(\.url) == [active.standardizedFileURL])
+    #expect(locator.metrics.directoryEntriesVisited < 20)
+    #expect(locator.metrics.discoveredPathCount == 1)
   }
 
   @Test
@@ -741,6 +875,66 @@ struct CodexSessionActivityMonitorTests {
   }
 
   @Test
+  func eventSourceStartFailureUsesFiniteBackoffAndReturnsHealthy() async throws {
+    let fixture = try SessionFixture()
+    let starts = LockedCounter()
+    let callbacks = LockedCounter()
+    let stops = LockedCounter()
+    let observer = FSEventsCodexSessionFileChangeObserver(
+      sessionRoot: fixture.directory,
+      startStream: {
+        let attempt = starts.increment()
+        return attempt >= 3
+      },
+      stopStream: {
+        stops.increment()
+      },
+      retryDelays: [0.01, 0.01, 0.01]
+    )
+
+    observer.start { callbacks.increment() }
+    for _ in 0..<100 where starts.value < 3 {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    try await Task.sleep(for: .milliseconds(20))
+
+    #expect(starts.value >= 3)
+    #expect(observer.isEventSourceHealthy)
+    #expect(callbacks.value >= 1)
+    #expect(observer.takeChanges().requiresFullScan)
+
+    observer.stop()
+    let startsAfterStop = starts.value
+    try await Task.sleep(for: .milliseconds(40))
+    #expect(starts.value == startsAfterStop)
+    #expect(stops.value == 1)
+  }
+
+  @Test
+  func eventSourceCanRestartAfterACompletedStop() async throws {
+    let fixture = try SessionFixture()
+    let starts = LockedCounter()
+    let observer = FSEventsCodexSessionFileChangeObserver(
+      sessionRoot: fixture.directory,
+      startStream: {
+        starts.increment()
+        return true
+      },
+      retryDelays: [0.01]
+    )
+
+    observer.start {}
+    try await Task.sleep(for: .milliseconds(10))
+    observer.stop()
+    observer.start {}
+    try await Task.sleep(for: .milliseconds(10))
+
+    #expect(starts.value == 2)
+    #expect(observer.isEventSourceHealthy)
+    observer.stop()
+  }
+
+  @Test
   func optInFSEventsConfigurationMeasurement() async throws {
     guard ProcessInfo.processInfo.environment["CODEX_NOT_SLEEP_MEASURE_FSEVENTS"] == "1" else {
       return
@@ -757,28 +951,40 @@ struct CodexSessionActivityMonitorTests {
         configuration: configuration
       )
       observer.start {}
-      defer { observer.stop() }
 
       let file = try fixture.makeRootSession(events: [start("measure")])
+      let cpuStart = processCPUSeconds()
       let creationStart = Date.now
-      while observer.takeChanges().paths.isEmpty,
-        Date.now.timeIntervalSince(creationStart) < 2
-      {
+      var creationObserved = false
+      while !creationObserved, Date.now.timeIntervalSince(creationStart) < 2 {
+        creationObserved = !observer.takeChanges().paths.isEmpty
+        guard !creationObserved else { break }
         try await Task.sleep(for: .milliseconds(20))
       }
-      let creationLatency = Date.now.timeIntervalSince(creationStart)
+      let creationLatency =
+        creationObserved
+        ? Date.now.timeIntervalSince(creationStart)
+        : nil
 
       let completionStart = Date.now
       try fixture.append(complete("measure"), to: file)
-      while observer.takeChanges().paths.isEmpty,
-        Date.now.timeIntervalSince(completionStart) < 2
-      {
+      var completionObserved = false
+      while !completionObserved, Date.now.timeIntervalSince(completionStart) < 2 {
+        completionObserved = !observer.takeChanges().paths.isEmpty
+        guard !completionObserved else { break }
         try await Task.sleep(for: .milliseconds(20))
       }
-      let completionLatency = Date.now.timeIntervalSince(completionStart)
+      let completionLatency =
+        completionObserved
+        ? Date.now.timeIntervalSince(completionStart)
+        : nil
+      let cpuSeconds = processCPUSeconds() - cpuStart
       print(
         "FSEvents " + name
-          + ": creation=\(creationLatency)s completion=\(completionLatency)s callbacks=\(observer.observedCallbackCount)"
+          + ": creation=\(creationLatency.map { "\($0)s" } ?? "unavailable")"
+          + " completion=\(completionLatency.map { "\($0)s" } ?? "unavailable")"
+          + " callbacks=\(observer.observedCallbackCount) cpu=\(cpuSeconds)s"
+          + " wakeups=unavailable energy=unavailable"
       )
       observer.stop()
     }
@@ -818,6 +1024,18 @@ struct CodexSessionActivityMonitorTests {
       + "\n"
   }
 
+  private func paddedStart(_ turnID: String, paddingBytes: Int) -> String {
+    let fixed =
+      #"{"type":"event_msg","payload":{"type":"task_started","turn_id":"__TURN__","started_at":2000,"padding":""}}"#
+      .replacingOccurrences(of: "__TURN__", with: turnID)
+    let marker = "\"padding\":\"\""
+    let padding = max(0, paddingBytes - fixed.utf8.count + marker.utf8.count)
+    return fixed.replacingOccurrences(
+      of: marker,
+      with: "\"padding\":\"\(String(repeating: "x", count: padding))\""
+    ) + "\n"
+  }
+
   private func complete(_ turnID: String) -> String {
     #"{"timestamp":"2026-07-23T00:00:01Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"__TURN__","last_agent_message":"not retained"}}"#
       .replacingOccurrences(of: "__TURN__", with: turnID)
@@ -835,6 +1053,13 @@ struct CodexSessionActivityMonitorTests {
     #"{"type":"event_msg","payload":{"type":"agent_message","message":"task_complete in prose"}}"#
       + "\n"
   }
+}
+
+private func processCPUSeconds() -> TimeInterval {
+  var usage = rusage()
+  guard getrusage(RUSAGE_SELF, &usage) == 0 else { return .nan }
+  return TimeInterval(usage.ru_utime.tv_sec) + TimeInterval(usage.ru_utime.tv_usec) / 1_000_000
+    + TimeInterval(usage.ru_stime.tv_sec) + TimeInterval(usage.ru_stime.tv_usec) / 1_000_000
 }
 
 extension CodexLifecycleParseResult {
@@ -872,6 +1097,23 @@ private final class FakeCodexSessionFileChangeObserver: CodexSessionFileChangeOb
   func takeChanges() -> CodexSessionFileChanges {
     defer { changes = CodexSessionFileChanges() }
     return changes
+  }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storedValue = 0
+
+  var value: Int {
+    lock.withLock { storedValue }
+  }
+
+  @discardableResult
+  func increment() -> Int {
+    lock.withLock {
+      storedValue += 1
+      return storedValue
+    }
   }
 }
 

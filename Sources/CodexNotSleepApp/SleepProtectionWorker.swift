@@ -40,6 +40,31 @@ final class SleepProtectionWorker: @unchecked Sendable {
       }, completion: completion)
   }
 
+  func inspectClosedLidSetup(
+    completion: @escaping @MainActor @Sendable (PowerProtectSetupState) -> Void
+  ) {
+    queue.async { [self] in
+      let state =
+        (self.backend as? any ClosedLidProtectionInspecting)?.closedLidSetupState
+        ?? .unavailable
+      DispatchQueue.main.async {
+        completion(state)
+      }
+    }
+  }
+
+  func releaseClosedLid(
+    completion: @escaping @MainActor @Sendable (Result<Void, Error>) -> Void
+  ) {
+    submit(
+      { backend in
+        guard let manager = backend as? any ClosedLidProtectionReleasing else {
+          return
+        }
+        try manager.releaseClosedLid()
+      }, completion: completion)
+  }
+
   func setClosedLidEnabled(
     _ enabled: Bool,
     completion: @escaping @MainActor @Sendable (Result<Void, Error>) -> Void

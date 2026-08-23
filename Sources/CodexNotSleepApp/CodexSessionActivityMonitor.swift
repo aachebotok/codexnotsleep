@@ -27,11 +27,13 @@ enum CodexActivitySnapshot: Equatable, Sendable {
 protocol CodexActivityProviding: AnyObject {
   var snapshot: CodexActivitySnapshot { get }
   var hasPendingWork: Bool { get }
+  var isEventSourceHealthy: Bool { get }
 
   @discardableResult
   func refresh() -> CodexActivitySnapshot
 
   func reset()
+  func requestPendingWorkContinuation()
 
   /// Starts the event source used by the live app. Test doubles can use the
   /// default no-op implementation and continue to drive `refresh()` directly.
@@ -41,7 +43,9 @@ protocol CodexActivityProviding: AnyObject {
 
 extension CodexActivityProviding {
   var hasPendingWork: Bool { false }
+  var isEventSourceHealthy: Bool { true }
   func reset() {}
+  func requestPendingWorkContinuation() {}
   func startMonitoring(onChange: @escaping @Sendable () -> Void) {}
   func stopMonitoring() {}
 }
@@ -86,6 +90,7 @@ struct CodexLocatorMetrics: Equatable, Sendable {
   var processTableScans = 0
   var fileDescriptorScans = 0
   var directoryScans = 0
+  var directoryEntriesVisited = 0
   var discoveredPathCount = 0
 }
 
@@ -112,40 +117,74 @@ struct FSEventsObserverConfiguration: Equatable, Sendable {
 
 protocol CodexSessionFileChangeObserving: AnyObject {
   func takeChanges() -> CodexSessionFileChanges
+  var isEventSourceHealthy: Bool { get }
+}
+
+extension CodexSessionFileChangeObserving {
+  var isEventSourceHealthy: Bool { true }
 }
 
 private protocol CodexSessionFileChangeNotifying: AnyObject {
   func start(onChange: @escaping @Sendable () -> Void)
   func stop()
+  var isEventSourceHealthy: Bool { get }
 }
 
 final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
   CodexSessionFileChangeObserving, CodexSessionFileChangeNotifying
 {
-  private let lock = NSLock()
   private let sessionRoot: URL
   private let configuration: FSEventsObserverConfiguration
   private let queue = DispatchQueue(
     label: "app.codexnotsleep.codex-session-events",
     qos: .utility
   )
+  private let queueKey = DispatchSpecificKey<UInt8>()
+  private let queueToken: UInt8 = 1
+  private let startStreamOverride: (() -> Bool)?
+  private let stopStreamOverride: (() -> Void)?
+  private let retryDelays: [TimeInterval]
   private var pendingChanges = CodexSessionFileChanges()
   private var callbackCount = 0
   private var stream: FSEventStreamRef?
   private var changeHandler: (@Sendable () -> Void)?
   private var isStarted = false
+  private var wantsMonitoring = false
+  private var eventSourceHealthy = true
+  private var retryAttempt = 0
+  private var retryWorkItem: DispatchWorkItem?
+
+  private static let defaultRetryDelays: [TimeInterval] = [1, 2, 4, 8, 16, 30]
 
   init(
     sessionRoot: URL,
-    configuration: FSEventsObserverConfiguration = .current
+    configuration: FSEventsObserverConfiguration = .current,
+    startStream: (() -> Bool)? = nil,
+    stopStream: (() -> Void)? = nil,
+    retryDelays: [TimeInterval] = FSEventsCodexSessionFileChangeObserver.defaultRetryDelays
   ) {
     self.sessionRoot = sessionRoot
     self.configuration = configuration
-    stream = nil
-    createStream()
+    startStreamOverride = startStream
+    stopStreamOverride = stopStream
+    self.retryDelays = retryDelays.isEmpty ? Self.defaultRetryDelays : retryDelays
+    queue.setSpecific(key: queueKey, value: queueToken)
+    queue.sync { createStreamLocked() }
   }
 
-  private func createStream() {
+  var isEventSourceHealthy: Bool {
+    onOwnerQueue { eventSourceHealthy }
+  }
+
+  private func onOwnerQueue<T>(_ body: () -> T) -> T {
+    if DispatchQueue.getSpecific(key: queueKey) == queueToken {
+      return body()
+    }
+    return queue.sync(execute: body)
+  }
+
+  private func createStreamLocked() {
+    guard startStreamOverride == nil else { return }
     var context = FSEventStreamContext(
       version: 0,
       info: Unmanaged.passUnretained(self).toOpaque(),
@@ -169,47 +208,39 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
       configuration.latency,
       flags
     )
-    guard let stream = self.stream else {
-      pendingChanges.requiresFullScan = true
-      return
+    if let stream {
+      FSEventStreamSetDispatchQueue(stream, queue)
+    } else {
+      markStartFailureLocked()
     }
-    FSEventStreamSetDispatchQueue(stream, queue)
   }
 
   deinit {
-    if let stream {
-      stop()
-      FSEventStreamInvalidate(stream)
-      FSEventStreamRelease(stream)
+    if DispatchQueue.getSpecific(key: queueKey) == queueToken {
+      disposeLocked()
+    } else {
+      queue.sync { disposeLocked() }
     }
   }
 
   func start(onChange: @escaping @Sendable () -> Void) {
-    lock.withLock {
+    onOwnerQueue {
       changeHandler = onChange
-    }
-    guard let stream, !isStarted else { return }
-    guard FSEventStreamStart(stream) else {
-      lock.withLock {
-        pendingChanges.requiresFullScan = true
+      wantsMonitoring = true
+      guard !isStarted else { return }
+      if retryWorkItem == nil, retryAttempt >= retryDelays.count {
+        retryAttempt = 0
       }
-      return
+      startStreamLocked()
     }
-    isStarted = true
   }
 
   func stop() {
-    guard let stream, isStarted else {
-      lock.withLock { changeHandler = nil }
-      return
-    }
-    FSEventStreamStop(stream)
-    isStarted = false
-    lock.withLock { changeHandler = nil }
+    onOwnerQueue { disposeLocked(clearPendingChanges: false) }
   }
 
   func takeChanges() -> CodexSessionFileChanges {
-    lock.withLock {
+    onOwnerQueue {
       let changes = pendingChanges
       pendingChanges = CodexSessionFileChanges()
       return changes
@@ -217,7 +248,7 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
   }
 
   var observedCallbackCount: Int {
-    lock.withLock { callbackCount }
+    onOwnerQueue { callbackCount }
   }
 
   static func requiresFullScan(for flags: FSEventStreamEventFlags) -> Bool {
@@ -231,15 +262,14 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
       ) != 0
   }
 
-  private func receive(
-    paths: [String],
-    flags: UnsafePointer<FSEventStreamEventFlags>,
-    count: Int
-  ) {
-    var handler: (@Sendable () -> Void)?
-    lock.withLock {
+  private func receive(paths: [String], flags: [FSEventStreamEventFlags]) {
+    queue.async { [weak self] in
+      guard let self else { return }
       callbackCount += 1
-      for index in 0..<count {
+      if paths.count != flags.count {
+        pendingChanges.requiresFullScan = true
+      }
+      for index in flags.indices {
         let eventFlags = flags[index]
         if Self.requiresFullScan(for: eventFlags) {
           pendingChanges.requiresFullScan = true
@@ -248,35 +278,98 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
           pendingChanges.paths.insert(paths[index])
         }
       }
-      handler = changeHandler
-    }
-    handler?()
-    if Self.requiresRootRestart(flags: flags, count: count) {
-      queue.async { [weak self] in self?.restartStream() }
-    }
-  }
-
-  private static func requiresRootRestart(
-    flags: UnsafePointer<FSEventStreamEventFlags>,
-    count: Int
-  ) -> Bool {
-    (0..<count).contains {
-      flags[$0] & FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged) != 0
+      changeHandler?()
+      if Self.requiresRootRestart(flags: flags) {
+        restartStreamLocked()
+      }
     }
   }
 
-  private func restartStream() {
-    guard isStarted else { return }
+  private static func requiresRootRestart(flags: [FSEventStreamEventFlags]) -> Bool {
+    flags.contains {
+      $0 & FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged) != 0
+    }
+  }
+
+  private func restartStreamLocked() {
+    guard wantsMonitoring else { return }
     if let stream {
       FSEventStreamStop(stream)
       FSEventStreamInvalidate(stream)
       FSEventStreamRelease(stream)
       self.stream = nil
     }
-    createStream()
-    guard let stream, FSEventStreamStart(stream) else {
-      lock.withLock { pendingChanges.requiresFullScan = true }
+    if startStreamOverride == nil { createStreamLocked() }
+    isStarted = false
+    startStreamLocked()
+  }
+
+  private func startStreamLocked() {
+    guard wantsMonitoring, !isStarted else { return }
+    let didStart: Bool
+    if let startStreamOverride {
+      didStart = startStreamOverride()
+    } else if let stream {
+      didStart = FSEventStreamStart(stream)
+    } else {
+      didStart = false
+    }
+
+    guard didStart else {
+      markStartFailureLocked()
       return
+    }
+
+    isStarted = true
+    eventSourceHealthy = true
+    retryAttempt = 0
+    cancelRetryLocked()
+  }
+
+  private func markStartFailureLocked() {
+    isStarted = false
+    eventSourceHealthy = false
+    pendingChanges.requiresFullScan = true
+    changeHandler?()
+    scheduleRetryLocked()
+  }
+
+  private func scheduleRetryLocked() {
+    guard wantsMonitoring, retryWorkItem == nil, retryAttempt < retryDelays.count else {
+      return
+    }
+    let delay = max(retryDelays[retryAttempt], 0.01)
+    retryAttempt += 1
+    let workItem = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.retryWorkItem = nil
+      self.startStreamLocked()
+    }
+    retryWorkItem = workItem
+    queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+  }
+
+  private func cancelRetryLocked() {
+    retryWorkItem?.cancel()
+    retryWorkItem = nil
+  }
+
+  private func disposeLocked(clearPendingChanges: Bool = true) {
+    wantsMonitoring = false
+    cancelRetryLocked()
+    if let stream {
+      if isStarted { FSEventStreamStop(stream) }
+      FSEventStreamInvalidate(stream)
+      FSEventStreamRelease(stream)
+      self.stream = nil
+    }
+    stopStreamOverride?()
+    isStarted = false
+    eventSourceHealthy = true
+    retryAttempt = 0
+    changeHandler = nil
+    if clearPendingChanges {
+      pendingChanges = CodexSessionFileChanges()
     }
   }
 
@@ -287,24 +380,31 @@ final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
       .fromOpaque(callbackInfo)
       .takeUnretainedValue()
     let pathArray = unsafeBitCast(eventPaths, to: NSArray.self)
-    observer.receive(
-      paths: pathArray as? [String] ?? [],
-      flags: eventFlags,
-      count: eventCount
-    )
+    let paths = pathArray as? [String] ?? []
+    let flags = (0..<eventCount).map { eventFlags[$0] }
+    observer.receive(paths: paths, flags: flags)
   }
 }
 
 protocol CodexOpenSessionEventSource: AnyObject {
+  var isEventSourceHealthy: Bool { get }
   func startMonitoring(onChange: @escaping @Sendable () -> Void)
   func stopMonitoring()
 }
 
-final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenSessionEventSource {
+private protocol CodexKnownFileContinuationRequesting: AnyObject {
+  func requestKnownFileContinuation()
+}
+
+final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating,
+  CodexOpenSessionEventSource, CodexKnownFileContinuationRequesting
+{
   private static let discoveryInterval: TimeInterval = 5 * 60
   private static let processStartTolerance: TimeInterval = 5
   private static let maximumDiscoveredPaths = 256
   private static let discoveredPathLifetime: TimeInterval = 30 * 60
+  private static let maximumEnumerationEntries = 2_048
+  private static let maximumEnumerationDepth = 6
 
   private let sessionRoot: URL
   private let userID: uid_t
@@ -318,7 +418,13 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
   private var discoveredForRuntimeStartedAt: Date?
   private var lastDiscoveryAt = Date.distantPast
   private var cachedInventory: CodexOpenSessionInventory?
+  private var continuationRequested = false
   private(set) var metrics = CodexLocatorMetrics()
+
+  private struct EnumerationItem {
+    let url: URL
+    let depth: Int
+  }
 
   init(
     sessionRoot: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -340,8 +446,25 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
       changeObserver ?? FSEventsCodexSessionFileChangeObserver(sessionRoot: self.sessionRoot)
   }
 
+  var isEventSourceHealthy: Bool {
+    (changeObserver as? any CodexSessionFileChangeNotifying)?.isEventSourceHealthy ?? true
+  }
+
+  func requestKnownFileContinuation() {
+    continuationRequested = true
+  }
+
   func locateOpenSessions() throws -> CodexOpenSessionInventory {
     let changes = changeObserver.takeChanges()
+    let shouldContinueKnownFiles = continuationRequested
+    continuationRequested = false
+    if shouldContinueKnownFiles, let cachedInventory,
+      canUseCachedInventoryForContinuation(cachedInventory, changes: changes)
+    {
+      let inventory = inventoryAfterKnownFileChanges(cachedInventory, changes: changes)
+      self.cachedInventory = inventory
+      return inventory
+    }
     if let cachedInventory, canUseCachedInventory(for: changes) {
       let inventory = inventoryAfterKnownFileChanges(cachedInventory, changes: changes)
       self.cachedInventory = inventory
@@ -413,6 +536,19 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
 
   func stopMonitoring() {
     (changeObserver as? CodexSessionFileChangeNotifying)?.stop()
+  }
+
+  private func canUseCachedInventoryForContinuation(
+    _ inventory: CodexOpenSessionInventory,
+    changes: CodexSessionFileChanges
+  ) -> Bool {
+    guard !changes.requiresFullScan else { return false }
+    guard !changes.paths.isEmpty || !inventory.files.isEmpty else { return false }
+    let knownPaths = Set(inventory.files.map { $0.url.standardizedFileURL.path })
+    return changes.paths.allSatisfy { path in
+      let normalizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
+      return isSessionJSONL(normalizedPath) && knownPaths.contains(normalizedPath)
+    }
   }
 
   private func canUseCachedInventory(for changes: CodexSessionFileChanges) -> Bool {
@@ -488,35 +624,69 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
     else { return }
 
     let cutoff = runtimeStartedAt.addingTimeInterval(-Self.processStartTolerance)
-    let resourceKeys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
+    let resourceKeys: [URLResourceKey] = [
+      .contentModificationDateKey, .isRegularFileKey, .isDirectoryKey,
+    ]
     var paths: [String: Date] = [:]
     var wasReliable = true
     metrics.directoryScans += 1
-    let enumerator = fileManager.enumerator(
-      at: sessionRoot,
-      includingPropertiesForKeys: resourceKeys,
-      options: [.skipsHiddenFiles, .skipsPackageDescendants]
-    ) { _, _ in
-      wasReliable = false
-      return true
+    metrics.directoryEntriesVisited = 0
+    guard fileManager.fileExists(atPath: sessionRoot.path) else {
+      discoveredPaths = [:]
+      metrics.discoveredPathCount = 0
+      discoveryWasReliable = wasReliable
+      discoveredForRuntimeStartedAt = runtimeStartedAt
+      lastDiscoveryAt = currentTime
+      return
     }
 
-    if let enumerator {
-      for case let url as URL in enumerator {
-        guard isSessionJSONL(url.path) else { continue }
+    var pending = [EnumerationItem(url: sessionRoot, depth: 0)]
+    while !pending.isEmpty {
+      guard metrics.directoryEntriesVisited < Self.maximumEnumerationEntries else {
+        wasReliable = false
+        break
+      }
+      let item = pending.removeFirst()
+      metrics.directoryEntriesVisited += 1
+
+      guard let values = try? item.url.resourceValues(forKeys: Set(resourceKeys)) else {
+        wasReliable = false
+        continue
+      }
+
+      if values.isDirectory == true {
+        guard item.depth < Self.maximumEnumerationDepth else {
+          wasReliable = false
+          continue
+        }
+        if shouldPruneDirectory(item.url, cutoff: cutoff, currentTime: currentTime) {
+          continue
+        }
         do {
-          let values = try url.resourceValues(forKeys: Set(resourceKeys))
-          guard
-            values.isRegularFile == true,
-            let modifiedAt = values.contentModificationDate,
-            modifiedAt >= cutoff
-          else { continue }
-          paths[url.standardizedFileURL.path] = modifiedAt
+          let children = try fileManager.contentsOfDirectory(
+            at: item.url,
+            includingPropertiesForKeys: resourceKeys,
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+          )
+          pending.append(
+            contentsOf: children.map {
+              EnumerationItem(url: $0, depth: item.depth + 1)
+            })
         } catch {
           wasReliable = false
         }
+        continue
       }
-    } else if fileManager.fileExists(atPath: sessionRoot.path) {
+
+      guard isSessionJSONL(item.url.path), values.isRegularFile == true,
+        let modifiedAt = values.contentModificationDate,
+        modifiedAt >= cutoff,
+        modifiedAt <= currentTime.addingTimeInterval(Self.processStartTolerance)
+      else { continue }
+      paths[item.url.standardizedFileURL.path] = modifiedAt
+    }
+
+    if !fileManager.fileExists(atPath: sessionRoot.path) {
       wasReliable = false
     }
 
@@ -530,6 +700,40 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
     discoveryWasReliable = wasReliable
     discoveredForRuntimeStartedAt = runtimeStartedAt
     lastDiscoveryAt = currentTime
+  }
+
+  private func shouldPruneDirectory(
+    _ url: URL,
+    cutoff: Date,
+    currentTime: Date
+  ) -> Bool {
+    if let partitionDate = datePartitionStart(for: url) {
+      return partitionDate < Calendar.current.startOfDay(for: cutoff)
+    }
+    guard
+      let values = try? url.resourceValues(
+        forKeys: [.contentModificationDateKey]
+      ), let modifiedAt = values.contentModificationDate
+    else {
+      return false
+    }
+    return modifiedAt < cutoff
+      && currentTime.timeIntervalSince(modifiedAt) > Self.discoveredPathLifetime
+  }
+
+  private func datePartitionStart(for url: URL) -> Date? {
+    let components = url.pathComponents
+    guard components.count >= 3 else { return nil }
+    let calendar = Calendar(identifier: .gregorian)
+    for index in stride(from: components.count - 3, through: 0, by: -1) {
+      guard
+        let year = Int(components[index]), year >= 2000, year <= 3000,
+        let month = Int(components[index + 1]), (1...12).contains(month),
+        let day = Int(components[index + 2]), (1...31).contains(day)
+      else { continue }
+      return calendar.date(from: DateComponents(year: year, month: month, day: day))
+    }
+    return nil
   }
 
   private func resetDiscovery() {
@@ -861,7 +1065,9 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
   }
 
   private static let reverseScanChunkSize = 64 * 1_024
-  private static let reverseScanOverlap = 2 * 1_024
+  // A backward chunk may end in any supported JSONL record. Retain the full
+  // advertised line budget plus its newline when reconstructing the next chunk.
+  private static let reverseScanOverlap = CodexLifecycleParser.maximumSupportedLineBytes + 1
   private static let maximumReverseScanBytes = 64 * 1_024 * 1_024
   private static let maximumUpdateBytes = 512 * 1_024
   private static let maximumLinePrefixBytes = CodexLifecycleParser.maximumSupportedLineBytes
@@ -869,6 +1075,7 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
   private static let processStartTolerance: TimeInterval = 5
   private static let failedFileLivenessWindow: TimeInterval = 15 * 60
   private static let emptyRuntimeLivenessWindow: TimeInterval = 15 * 60
+  private static let uncertaintyLivenessWindow: TimeInterval = 15 * 60
 
   private let locator: CodexOpenSessionLocating
   private let fileManager: FileManager
@@ -876,6 +1083,7 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
   private var states: [String: FileState] = [:]
   private var failureLiveness: [String: FailureLiveness] = [:]
   private var emptyInventorySince: Date?
+  private var uncertaintySince: Date?
   private var lastKnownRuntime = false
   private var hasObservedSession = false
 
@@ -884,6 +1092,10 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
 
   var hasPendingWork: Bool {
     states.values.contains { $0.hasPendingBacklog }
+  }
+
+  var isEventSourceHealthy: Bool {
+    (locator as? any CodexOpenSessionEventSource)?.isEventSourceHealthy ?? true
   }
 
   convenience init(
@@ -912,10 +1124,15 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     states.removeAll()
     failureLiveness.removeAll()
     emptyInventorySince = nil
+    uncertaintySince = nil
     lastKnownRuntime = false
     hasObservedSession = false
     snapshot = .idle
     metrics.trackedStateCount = 0
+  }
+
+  func requestPendingWorkContinuation() {
+    (locator as? any CodexKnownFileContinuationRequesting)?.requestKnownFileContinuation()
   }
 
   func startMonitoring(onChange: @escaping @Sendable () -> Void) {
@@ -934,8 +1151,15 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       inventory = try locator.locateOpenSessions()
     } catch {
       metrics.trackedStateCount = states.count
-      let shouldProtect = snapshot.effectiveActiveCount > 0 || lastKnownRuntime
-      snapshot = .unavailable(protectConservatively: shouldProtect)
+      let currentTime = now()
+      let since = uncertaintySince ?? currentTime
+      uncertaintySince = since
+      let isWithinRecoveryWindow =
+        currentTime.timeIntervalSince(since) < Self.uncertaintyLivenessWindow
+      let hasPositiveEvidence = snapshot.effectiveActiveCount > 0 || lastKnownRuntime
+      snapshot = .unavailable(
+        protectConservatively: isWithinRecoveryWindow && hasPositiveEvidence
+      )
       return snapshot
     }
 
@@ -944,6 +1168,7 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       states.removeAll()
       failureLiveness.removeAll()
       emptyInventorySince = nil
+      uncertaintySince = nil
       hasObservedSession = false
       snapshot = .idle
       metrics.trackedStateCount = 0
@@ -956,9 +1181,17 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       metrics.trackedStateCount = 0
       guard inventory.isReliable else {
         emptyInventorySince = nil
-        snapshot = .unavailable(protectConservatively: true)
+        let currentTime = now()
+        let since = uncertaintySince ?? currentTime
+        uncertaintySince = since
+        snapshot = .unavailable(
+          protectConservatively:
+            currentTime.timeIntervalSince(since) < Self.uncertaintyLivenessWindow
+        )
         return snapshot
       }
+
+      uncertaintySince = nil
 
       // Once a session has been observed, a reliable empty inventory means
       // that its Codex task has ended even if the Codex process remains alive.
@@ -993,14 +1226,19 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
 
     let currentTime = now()
     var hasLiveFileFailure = false
+    var hasPositiveActivityEvidence = false
     for openFile in inventory.files {
       let path = openFile.url.standardizedFileURL.path
       do {
         let identity = try fileIdentity(at: openFile.url)
         if var state = states[path], state.identity == identity {
           state.ownerStartedAt = openFile.ownerStartedAt
+          let previousOffset = state.processedOffset
           try update(&state, from: openFile.url)
           discardStaleTurnIfNeeded(in: &state)
+          hasPositiveActivityEvidence =
+            hasPositiveActivityEvidence
+            || state.processedOffset > previousOffset
           states[path] = state
           failureLiveness.removeValue(forKey: path)
         } else {
@@ -1015,6 +1253,7 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
               ownerStartedAt: openFile.ownerStartedAt
             )
             discardStaleTurnIfNeeded(in: &state)
+            hasPositiveActivityEvidence = hasPositiveActivityEvidence || state.isActive
             states[path] = state
             failureLiveness.removeValue(forKey: path)
           case .unknown:
@@ -1055,12 +1294,26 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       $0.isActive && !$0.isStalled(now: currentTime)
     }
     if hadFailure {
+      if hasPositiveActivityEvidence {
+        // Fresh lifecycle bytes or a successfully reconstructed active turn
+        // are positive evidence. Re-enter the bounded recovery window, while
+        // repeated failures without new evidence continue to age naturally.
+        uncertaintySince = nil
+      }
+      let since = uncertaintySince ?? currentTime
+      uncertaintySince = since
+      let isWithinRecoveryWindow =
+        currentTime.timeIntervalSince(since) < Self.uncertaintyLivenessWindow
       snapshot = .unavailable(
         protectConservatively: activeCount > 0 || inventory.hasCodexRuntime
+          ? isWithinRecoveryWindow
+          : false
       )
     } else if activeCount > 0 {
+      uncertaintySince = nil
       snapshot = .active(turnCount: activeCount)
     } else {
+      uncertaintySince = nil
       snapshot = .idle
     }
     metrics.trackedStateCount = states.count
@@ -1080,17 +1333,20 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
           < Self.failedFileLivenessWindow
       }
       failureLiveness[path] = FailureLiveness(size: size, changedAt: currentTime)
+      uncertaintySince = currentTime
       return true
     } catch {
       guard fileManager.fileExists(atPath: path) else {
         failureLiveness.removeValue(forKey: path)
         return false
       }
-      let previousSize = failureLiveness[path]?.size ?? 0
-      failureLiveness[path] = FailureLiveness(
-        size: previousSize,
-        changedAt: currentTime
-      )
+      if let previous = failureLiveness[path] {
+        // Metadata/read failures do not constitute fresh activity. Keep the
+        // original timestamp so repeated failures age out naturally.
+        return currentTime.timeIntervalSince(previous.changedAt)
+          < Self.failedFileLivenessWindow
+      }
+      failureLiveness[path] = FailureLiveness(size: 0, changedAt: currentTime)
       return true
     }
   }
@@ -1304,50 +1560,64 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
         cursor
       )
       let start = cursor - count
+      let hasPartialLeadingLine = try hasPartialLeadingLine(handle: handle, startOffset: start)
       try handle.seek(toOffset: start)
       var chunk = try handle.read(upToCount: Int(count)) ?? Data()
       let newDataCount = chunk.count
       chunk.append(suffix)
 
-      let scan = CodexLifecycleParser.scan(chunk)
-      if scan.oversizedOffsets.contains(where: { $0 < newDataCount }) {
-        return BootstrapLifecycleState(
-          currentTurnID: nil,
-          currentTurnStartedAt: nil,
-          hasObservedSupportedLifecycle: observedLifecycle,
-          hasOverLimitRecord: true
-        )
+      var lines: [CodexLifecycleParseResult] = []
+      var lineStart = chunk.startIndex
+      while lineStart < chunk.endIndex {
+        guard let lineEnd = chunk[lineStart...].firstIndex(of: 0x0A) else {
+          break
+        }
+        let offset = chunk.distance(from: chunk.startIndex, to: lineStart)
+        if offset <= newDataCount && !(offset == 0 && hasPartialLeadingLine) {
+          lines.append(CodexLifecycleParser.parse(Data(chunk[lineStart..<lineEnd])))
+        }
+        lineStart = chunk.index(after: lineEnd)
       }
-      if scan.malformedOffsets.contains(where: { $0 < newDataCount }) {
-        throw CocoaError(.fileReadCorruptFile)
-      }
-      for positionedEvent in scan.events.reversed()
-      where positionedEvent.offset < newDataCount {
-        let event = positionedEvent.event
-        observedLifecycle = true
 
-        switch event.kind {
-        case .completed:
-          guard let turnID = event.turnID else {
+      for result in lines.reversed() {
+        switch result {
+        case .oversizedRecord:
+          return BootstrapLifecycleState(
+            currentTurnID: nil,
+            currentTurnStartedAt: nil,
+            hasObservedSupportedLifecycle: observedLifecycle,
+            hasOverLimitRecord: true
+          )
+        case .malformedLifecycleEvent:
+          throw CocoaError(.fileReadCorruptFile)
+        case .irrelevant:
+          continue
+        case .event(let event):
+          observedLifecycle = true
+
+          switch event.kind {
+          case .completed:
+            guard let turnID = event.turnID else {
+              return BootstrapLifecycleState(
+                currentTurnID: nil,
+                currentTurnStartedAt: nil,
+                hasObservedSupportedLifecycle: true,
+                hasOverLimitRecord: false
+              )
+            }
+            completedTurnIDs.insert(turnID)
+          case .started:
+            guard let turnID = event.turnID else {
+              throw CocoaError(.fileReadCorruptFile)
+            }
+            let isCompleted = completedTurnIDs.contains(turnID)
             return BootstrapLifecycleState(
-              currentTurnID: nil,
-              currentTurnStartedAt: nil,
+              currentTurnID: isCompleted ? nil : turnID,
+              currentTurnStartedAt: isCompleted ? nil : event.startedAt,
               hasObservedSupportedLifecycle: true,
               hasOverLimitRecord: false
             )
           }
-          completedTurnIDs.insert(turnID)
-        case .started:
-          guard let turnID = event.turnID else {
-            throw CocoaError(.fileReadCorruptFile)
-          }
-          let isCompleted = completedTurnIDs.contains(turnID)
-          return BootstrapLifecycleState(
-            currentTurnID: isCompleted ? nil : turnID,
-            currentTurnStartedAt: isCompleted ? nil : event.startedAt,
-            hasObservedSupportedLifecycle: true,
-            hasOverLimitRecord: false
-          )
         }
       }
 
@@ -1397,6 +1667,13 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       scannedBytes += UInt64(data.count)
     }
     return CommittedOffset(offset: endOffset, foundNewline: false)
+  }
+
+  private func hasPartialLeadingLine(handle: FileHandle, startOffset: UInt64) throws -> Bool {
+    guard startOffset > 0 else { return false }
+    try handle.seek(toOffset: startOffset - 1)
+    let preceding = try handle.read(upToCount: 1) ?? Data()
+    return preceding.first != 0x0A
   }
 
   private func fileIdentity(at url: URL) throws -> UInt64 {

@@ -36,6 +36,11 @@ final class ProtectionPreferenceStore {
     defaults.bool(forKey: Self.closedLidKey)
   }
 
+  func loadClosedLidPreference() -> Bool? {
+    guard defaults.object(forKey: Self.closedLidKey) != nil else { return nil }
+    return defaults.bool(forKey: Self.closedLidKey)
+  }
+
   func saveClosedLidEnabled(_ isEnabled: Bool) {
     defaults.set(isEnabled, forKey: Self.closedLidKey)
   }

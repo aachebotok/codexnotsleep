@@ -84,6 +84,23 @@ struct BatteryStatusProviderTests {
     #expect(provider.currentStatus() == second)
     #expect(fixture.readCount == 2)
   }
+
+  @Test
+  func anInvalidationDuringAReadCannotPublishTheOldGeneration() async throws {
+    let first = BatteryStatus(chargePercent: 80, isRunningOnBattery: false)
+    let second = BatteryStatus(chargePercent: 9, isRunningOnBattery: true)
+    let fixture = BlockingBatteryReadFixture(status: first)
+    let provider = IOKitBatteryStatusProvider(readStatus: fixture.read)
+
+    let readTask = Task.detached { provider.currentStatus() }
+    fixture.waitUntilReadStarted()
+    provider.invalidateCacheForTesting()
+    fixture.status = second
+    fixture.allowReadToFinish()
+
+    #expect(await readTask.value == nil)
+    #expect(provider.currentStatus() == second)
+  }
 }
 
 private final class BatteryReadFixture: @unchecked Sendable {
@@ -104,5 +121,42 @@ private final class BatteryReadFixture: @unchecked Sendable {
       readCount += 1
       return storedStatus
     }
+  }
+}
+
+private final class BlockingBatteryReadFixture: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storedStatus: BatteryStatus
+  private var blocksNextRead = true
+  private let started = DispatchSemaphore(value: 0)
+  private let continueReading = DispatchSemaphore(value: 0)
+
+  init(status: BatteryStatus) {
+    storedStatus = status
+  }
+
+  var status: BatteryStatus {
+    get { lock.withLock { storedStatus } }
+    set { lock.withLock { storedStatus = newValue } }
+  }
+
+  func read() -> BatteryStatus? {
+    started.signal()
+    let shouldBlock = lock.withLock { () -> Bool in
+      defer { blocksNextRead = false }
+      return blocksNextRead
+    }
+    if shouldBlock {
+      continueReading.wait()
+    }
+    return status
+  }
+
+  func waitUntilReadStarted() {
+    _ = started.wait(timeout: .now() + 2)
+  }
+
+  func allowReadToFinish() {
+    continueReading.signal()
   }
 }

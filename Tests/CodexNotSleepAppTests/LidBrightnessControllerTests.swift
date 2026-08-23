@@ -285,6 +285,58 @@ struct LidBrightnessControllerTests {
   }
 
   @Test
+  func displayRestoresEvenWhenKeyboardRestoreIsTemporarilyUnavailable() {
+    let sensor = TestLidAngleSensor(angle: 25)
+    let display = TestDisplayBrightnessProvider(brightness: 0.8)
+    let keyboard = TestKeyboardBacklightProvider(brightness: 0.7)
+    let controller = LidBrightnessController(
+      angleSensor: sensor,
+      displayProvider: display,
+      keyboardProvider: keyboard,
+      schedulesTimer: false
+    )
+
+    controller.setCodexWorking(true)
+    let start = Date()
+    controller.refreshBrightness(at: start)
+    controller.refreshBrightness(
+      at: start.addingTimeInterval(LidBrightnessController.transitionDuration)
+    )
+    keyboard.failNextWrite = true
+    controller.setCodexWorking(false)
+
+    #expect(display.brightness == 0.8)
+    #expect(keyboard.brightness != 0.7)
+    #expect(controller.isRestoreRetryScheduled)
+  }
+
+  @Test
+  func brightnessRestoreRetryBudgetIsFinite() async throws {
+    let sensor = TestLidAngleSensor(angle: 25)
+    let display = TestDisplayBrightnessProvider(brightness: 0.8)
+    let keyboard = TestKeyboardBacklightProvider(brightness: 0.7)
+    let controller = LidBrightnessController(
+      angleSensor: sensor,
+      displayProvider: display,
+      keyboardProvider: keyboard,
+      schedulesTimer: false
+    )
+
+    controller.setCodexWorking(true)
+    let start = Date()
+    controller.refreshBrightness(at: start)
+    controller.refreshBrightness(
+      at: start.addingTimeInterval(LidBrightnessController.transitionDuration)
+    )
+    keyboard.failAllWrites = true
+    controller.setCodexWorking(false)
+    try await Task.sleep(for: .seconds(1.1))
+
+    #expect(!controller.isRestoreRetryScheduled)
+    #expect(keyboard.brightness != 0.7)
+  }
+
+  @Test
   func controllerDimsOnlyForConfirmedActiveCodexWork() {
     let suiteName = "CodexNotSleep.LidBrightnessTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!
@@ -369,6 +421,8 @@ private final class TestKeyboardBacklightProvider: KeyboardBacklightProviding {
   let keyboardID: UInt64 = 95_158_272
   private(set) var brightness: Double
   private(set) var writes: [Double] = []
+  var failNextWrite = false
+  var failAllWrites = false
 
   init(brightness: Double) {
     self.brightness = brightness
@@ -379,6 +433,11 @@ private final class TestKeyboardBacklightProvider: KeyboardBacklightProviding {
   }
 
   func setBrightness(_ brightness: Double, for keyboardID: UInt64) -> Bool {
+    if failAllWrites { return false }
+    if failNextWrite {
+      failNextWrite = false
+      return false
+    }
     self.brightness = brightness
     writes.append(brightness)
     return true

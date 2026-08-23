@@ -56,7 +56,7 @@ final class IdleSleepAssertionBackend: SleepProtectionBackend {
     guard !isHeld else { return }
 
     let result = assertionManager.createPreventUserIdleSystemSleep(
-      name: "Codex Not Sleep: supported coding agent is running",
+      name: "Codexetine: supported coding agent is running",
       assertionID: &assertionID
     )
     guard result == kIOReturnSuccess else {

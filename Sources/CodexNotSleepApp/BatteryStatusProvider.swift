@@ -26,6 +26,8 @@ final class IOKitBatteryStatusProvider: BatteryStatusProviding, @unchecked Senda
   private let lock = NSLock()
   private var cachedStatus: BatteryStatus?
   private var cacheIsValid = false
+  private var cacheGeneration: UInt64 = 0
+  private var monitoringGeneration: UInt64 = 0
   private var notificationSource: CFRunLoopSource?
   private var changeHandler: (@Sendable () -> Void)?
 
@@ -37,23 +39,30 @@ final class IOKitBatteryStatusProvider: BatteryStatusProviding, @unchecked Senda
   }
 
   func currentStatus() -> BatteryStatus? {
-    let cached = lock.withLock { (cacheIsValid, cachedStatus) }
+    let cached = lock.withLock { (cacheIsValid, cachedStatus, cacheGeneration) }
     if cached.0 {
       return cached.1
     }
 
     let status = readStatus()
-    lock.withLock {
+    let accepted = lock.withLock { () -> Bool in
+      guard cacheGeneration == cached.2 else {
+        // A power-source notification won while the read was in flight. Do
+        // not publish a stale result into the new generation.
+        return false
+      }
       cachedStatus = status
       cacheIsValid = true
+      return true
     }
-    return status
+    return accepted ? status : nil
   }
 
   func startMonitoring(onChange: @escaping @Sendable () -> Void) {
-    let shouldInstall = lock.withLock { () -> Bool in
+    let (shouldInstall, generation) = lock.withLock { () -> (Bool, UInt64) in
       changeHandler = onChange
-      return notificationSource == nil
+      monitoringGeneration &+= 1
+      return (notificationSource == nil, monitoringGeneration)
     }
     guard shouldInstall else { return }
 
@@ -66,6 +75,10 @@ final class IOKitBatteryStatusProvider: BatteryStatusProviding, @unchecked Senda
       return
     }
     let source = unmanagedSource.takeRetainedValue()
+    let shouldKeepSource = lock.withLock {
+      generation == monitoringGeneration && notificationSource == nil
+    }
+    guard shouldKeepSource else { return }
     lock.withLock { notificationSource = source }
     CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
   }
@@ -73,6 +86,8 @@ final class IOKitBatteryStatusProvider: BatteryStatusProviding, @unchecked Senda
   func stopMonitoring() {
     let source = lock.withLock { () -> CFRunLoopSource? in
       changeHandler = nil
+      monitoringGeneration &+= 1
+      cacheGeneration &+= 1
       let source = notificationSource
       notificationSource = nil
       return source
@@ -88,6 +103,7 @@ final class IOKitBatteryStatusProvider: BatteryStatusProviding, @unchecked Senda
 
   private func handlePowerSourceChange() {
     let handler = lock.withLock { () -> (@Sendable () -> Void)? in
+      cacheGeneration &+= 1
       cacheIsValid = false
       return changeHandler
     }

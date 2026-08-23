@@ -595,6 +595,7 @@ final class LidBrightnessController: LidBrightnessControlling {
   // the gaps between adjacent readings; the target always comes from the angle.
   static let transitionDuration: TimeInterval = 0.15
   private static let transitionCompletionTolerance: TimeInterval = 0.001
+  private static let restoreRetryDelays: [TimeInterval] = [0.1, 0.25, 0.5]
 
   private let angleSensor: any LidAngleProviding
   private let displayProvider: any DisplayBrightnessProviding
@@ -603,10 +604,13 @@ final class LidBrightnessController: LidBrightnessControlling {
   private var displayStates: [UInt32: BrightnessState] = [:]
   private var keyboardStates: [UInt64: BrightnessState] = [:]
   private var timer: Timer?
+  private var restoreRetryTask: Task<Void, Never>?
+  private var restoreRetryAttempt = 0
   private var isCodexWorking = false
   private var isBrightnessFeatureDisabled = false
 
   var isInterpolationTimerActive: Bool { timer != nil }
+  var isRestoreRetryScheduled: Bool { restoreRetryTask != nil }
 
   init(
     angleSensor: any LidAngleProviding,
@@ -630,6 +634,7 @@ final class LidBrightnessController: LidBrightnessControlling {
 
   func setCodexWorking(_ isWorking: Bool) {
     if isWorking {
+      cancelRestoreRetry(resetAttempt: true)
       if !isCodexWorking {
         isCodexWorking = true
         isBrightnessFeatureDisabled = false
@@ -650,6 +655,7 @@ final class LidBrightnessController: LidBrightnessControlling {
   func reset() {
     isCodexWorking = false
     angleSensor.stopMonitoring()
+    cancelRestoreRetry(resetAttempt: true)
     restoreBrightness(stopping: true)
   }
 
@@ -731,6 +737,38 @@ final class LidBrightnessController: LidBrightnessControlling {
     if stopping {
       angleSensor.stopMonitoring()
     }
+
+    if displayStates.isEmpty && keyboardStates.isEmpty {
+      cancelRestoreRetry(resetAttempt: true)
+    } else {
+      scheduleRestoreRetry()
+    }
+  }
+
+  private func scheduleRestoreRetry() {
+    guard restoreRetryTask == nil else { return }
+    guard restoreRetryAttempt < Self.restoreRetryDelays.count else {
+      NSLog("Codexetine bounded brightness restoration retries exhausted")
+      return
+    }
+    let delay = Self.restoreRetryDelays[restoreRetryAttempt]
+    restoreRetryAttempt += 1
+    restoreRetryTask = Task { @MainActor [weak self] in
+      do {
+        try await Task.sleep(for: .seconds(delay))
+      } catch {
+        return
+      }
+      guard let self, !Task.isCancelled else { return }
+      self.restoreRetryTask = nil
+      self.restoreBrightness(stopping: false)
+    }
+  }
+
+  private func cancelRestoreRetry(resetAttempt: Bool) {
+    restoreRetryTask?.cancel()
+    restoreRetryTask = nil
+    if resetAttempt { restoreRetryAttempt = 0 }
   }
 
   private func ensureTimer() {

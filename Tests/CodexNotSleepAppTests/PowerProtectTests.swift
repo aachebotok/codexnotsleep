@@ -200,7 +200,7 @@ struct PowerProtectTests {
     let appleScript = try #require(authorizationRunner.scripts.first)
     #expect(
       appleScript.contains(
-        "with prompt \"Allow Codex Not Sleep to keep your Mac running with the lid closed. You'll only need to confirm once.\""
+        "with prompt \"Allow Codexetine to keep your Mac running with the lid closed. You'll only need to confirm once.\""
       ))
     var compilationError: NSDictionary?
     let compiled = NSAppleScript(source: appleScript)?.compileAndReturnError(&compilationError)
@@ -313,6 +313,77 @@ struct PowerProtectTests {
   }
 
   @Test
+  func closedLidAcquireFailureDoesNotDropIOPMProtection() throws {
+    let idle = PartialSleepProtectionBackend(isHeld: false)
+    let closedLid = FailingClosedLidSleepBackend(enabled: true)
+    closedLid.failAcquire = true
+    let backend = CombinedSleepProtectionBackend(idleSleep: idle, closedLid: closedLid)
+
+    do {
+      try backend.acquire()
+      Issue.record("Expected optional closed-lid acquisition to fail")
+    } catch let error as ClosedLidProtectionError {
+      #expect(error == .acquisitionFailed)
+    }
+
+    #expect(idle.isHeld)
+    #expect(closedLid.acquireCount == 1)
+  }
+
+  @Test
+  func closedLidRenewalFailureLeavesIOPMHeldForLaterRecovery() throws {
+    let idle = PartialSleepProtectionBackend(isHeld: true)
+    let closedLid = FailingClosedLidSleepBackend(enabled: true, isHeld: true)
+    closedLid.failRenew = true
+    let backend = CombinedSleepProtectionBackend(idleSleep: idle, closedLid: closedLid)
+
+    do {
+      try backend.renew()
+      Issue.record("Expected optional closed-lid renewal to fail")
+    } catch let error as ClosedLidProtectionError {
+      #expect(error == .renewalFailed)
+    }
+
+    #expect(idle.isHeld)
+    #expect(closedLid.isHeld)
+  }
+
+  @Test
+  func closedLidReleaseFailureStillReleasesIOPM() throws {
+    let idle = PartialSleepProtectionBackend(isHeld: true)
+    let closedLid = FailingClosedLidSleepBackend(enabled: true, isHeld: true)
+    closedLid.failRelease = true
+    let backend = CombinedSleepProtectionBackend(idleSleep: idle, closedLid: closedLid)
+
+    do {
+      try backend.release()
+      Issue.record("Expected optional closed-lid release to fail")
+    } catch let error as ClosedLidProtectionError {
+      #expect(error == .releaseFailed)
+    }
+
+    #expect(!idle.isHeld)
+    #expect(closedLid.isHeld)
+  }
+
+  @Test
+  func closedLidRecoveryFailureDoesNotBlockIOPMRecovery() throws {
+    let idle = PartialSleepProtectionBackend(isHeld: false)
+    let closedLid = FailingClosedLidSleepBackend(enabled: true, isHeld: true)
+    closedLid.failRecover = true
+    let backend = CombinedSleepProtectionBackend(idleSleep: idle, closedLid: closedLid)
+
+    do {
+      try backend.recover()
+      Issue.record("Expected optional closed-lid recovery to fail")
+    } catch let error as ClosedLidProtectionError {
+      #expect(error == .recoveryFailed)
+    }
+
+    #expect(idle.recoverCount == 1)
+  }
+
+  @Test
   func ordinaryProtectionDoesNotRequireClosedLidSetup() throws {
     let idle = PartialSleepProtectionBackend(isHeld: false)
     let closedLid = TestClosedLidSleepBackend(enabled: false)
@@ -414,7 +485,7 @@ struct PowerProtectTests {
   }
 
   @Test
-  func watchdogShellScriptHasValidSyntaxAndRetriesCleanup() throws {
+  func watchdogShellScriptHasValidSyntaxAndUsesFinitePipeLiveness() throws {
     let runner = ProcessPowerProtectCommandRunner()
     let result = try runner.run(
       executable: "/bin/sh",
@@ -423,7 +494,9 @@ struct PowerProtectTests {
 
     #expect(result.status == 0)
     #expect(ProcessPowerProtectWatchdog.watchdogScript.contains("while ["))
-    #expect(ProcessPowerProtectWatchdog.watchdogScript.contains("/bin/sleep 2"))
+    #expect(ProcessPowerProtectWatchdog.watchdogScript.contains("/bin/cat </dev/stdin >/dev/null"))
+    #expect(ProcessPowerProtectWatchdog.watchdogScript.contains("maximum_retries=6"))
+    #expect(!ProcessPowerProtectWatchdog.watchdogScript.contains("kill -0 \"$CNS_PARENT_PID\""))
   }
 
   private static func pmsetState(_ isDisabled: Bool) -> PowerProtectCommandResult {
@@ -534,6 +607,7 @@ private final class PartialSleepProtectionBackend: SleepProtectionBackend {
   private(set) var isHeld: Bool
   private(set) var acquireCount = 0
   private(set) var renewCount = 0
+  private(set) var recoverCount = 0
 
   init(isHeld: Bool) {
     self.isHeld = isHeld
@@ -548,9 +622,73 @@ private final class PartialSleepProtectionBackend: SleepProtectionBackend {
     renewCount += 1
   }
 
+  func recover() throws {
+    recoverCount += 1
+  }
+
   func release() {
     isHeld = false
   }
+}
+
+private final class FailingClosedLidSleepBackend:
+  SleepProtectionBackend,
+  ClosedLidProtectionManaging,
+  ClosedLidProtectionInspecting,
+  ClosedLidProtectionReleasing
+{
+  let identifier = "failing-closed-lid-test"
+  private(set) var isHeld: Bool
+  private(set) var isClosedLidEnabled: Bool
+  private(set) var acquireCount = 0
+  private(set) var renewCount = 0
+  var failAcquire = false
+  var failRenew = false
+  var failRelease = false
+  var failRecover = false
+
+  init(enabled: Bool, isHeld: Bool = false) {
+    isClosedLidEnabled = enabled
+    self.isHeld = isHeld
+  }
+
+  var requiresSetup: Bool { false }
+  var closedLidSetupState: PowerProtectSetupState { .installedAndValid }
+
+  func prepare() throws {}
+  func prepareClosedLid() throws {}
+
+  func setClosedLidEnabled(_ enabled: Bool) {
+    isClosedLidEnabled = enabled
+  }
+
+  func recover() throws {
+    if failRecover { throw TestPowerProtectError.failed }
+  }
+
+  func acquire() throws {
+    acquireCount += 1
+    if failAcquire { throw TestPowerProtectError.failed }
+    isHeld = true
+  }
+
+  func renew() throws {
+    renewCount += 1
+    if failRenew { throw TestPowerProtectError.failed }
+  }
+
+  func release() throws {
+    if failRelease { throw TestPowerProtectError.failed }
+    isHeld = false
+  }
+
+  func releaseClosedLid() throws {
+    try release()
+  }
+}
+
+private enum TestPowerProtectError: Error {
+  case failed
 }
 
 private final class TestClosedLidSleepBackend:

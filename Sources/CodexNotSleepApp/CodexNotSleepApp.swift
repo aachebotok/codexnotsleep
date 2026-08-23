@@ -11,7 +11,7 @@ final class CodexNotSleepMenuBarController: NSObject, NSMenuDelegate {
     keyEquivalent: ""
   )
   private let closedLidItem = NSMenuItem(
-    title: "",
+    title: "Keep Awake with Lid Closed",
     action: #selector(toggleClosedLid(_:)),
     keyEquivalent: ""
   )
@@ -57,19 +57,19 @@ final class CodexNotSleepMenuBarController: NSObject, NSMenuDelegate {
     statusItem = item
 
     guard let button = item.button else {
-      NSLog("Codex Not Sleep: status item button was not created")
+      NSLog("Codexetine: status item button was not created")
       return
     }
 
     let image = NSImage(
       systemSymbolName: AppController.menuIconName,
-      accessibilityDescription: "Codex Not Sleep"
+      accessibilityDescription: "Codexetine"
     )
     image?.isTemplate = true
     button.image = image
     button.imageScaling = .scaleProportionallyDown
     button.imagePosition = .imageOnly
-    button.toolTip = "Codex Not Sleep"
+    button.toolTip = "Codexetine"
     updateMenu()
   }
 
@@ -88,6 +88,7 @@ final class CodexNotSleepMenuBarController: NSObject, NSMenuDelegate {
 
     if let closedLidTitle = controller.closedLidMenuTitle {
       closedLidItem.title = closedLidTitle
+      closedLidItem.state = controller.isClosedLidEnabled ? .on : .off
       closedLidItem.isHidden = false
       closedLidItem.isEnabled = !controller.isPreparingClosedLid
     } else {

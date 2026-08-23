@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 
@@ -43,6 +44,36 @@ struct BoundedProcessRunnerTests {
     #expect(result.didTimeout)
     #expect(!result.succeeded)
     #expect(result.status != nil)
+  }
+
+  @Test
+  func timeoutTerminatesDescendantsInTheOwnedProcessGroup() throws {
+    let marker = FileManager.default.temporaryDirectory.appending(
+      path: "CodexNotSleep.BoundedProcessRunner.\(UUID().uuidString).pid"
+    )
+    defer { try? FileManager.default.removeItem(at: marker) }
+
+    let result = try BoundedProcessRunner(
+      timeout: 0.1,
+      terminationGrace: 0.1
+    ).run(
+      executable: "/bin/sh",
+      arguments: [
+        "-c",
+        "sleep 30 & child=$!; printf '%s' \"$child\" > \"\(marker.path)\"; wait",
+      ]
+    )
+
+    #expect(result.didTimeout)
+    let childPID = try #require(
+      Int32(String(decoding: try Data(contentsOf: marker), as: UTF8.self))
+    )
+    var childStillExists = true
+    for _ in 0..<30 where childStillExists {
+      childStillExists = kill(childPID, 0) == 0
+      if childStillExists { usleep(10_000) }
+    }
+    #expect(!childStillExists)
   }
 
   @Test

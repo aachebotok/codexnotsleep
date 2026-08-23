@@ -3,13 +3,16 @@ import Foundation
 enum MenuIssue: Equatable {
   case permissionRequired
   case sleepRestoreRequired
+  case closedLidRecoveryRequired
 
   var title: String {
     switch self {
     case .permissionRequired:
-      "Use with Lid Closed…"
+      "Set Up Closed-Lid Protection…"
     case .sleepRestoreRequired:
       "Fix sleep issue"
+    case .closedLidRecoveryRequired:
+      "Fix closed-lid sleep issue"
     }
   }
 }

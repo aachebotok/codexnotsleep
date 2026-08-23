@@ -43,6 +43,7 @@ final class AppController: NSObject {
   private var pendingActivationIssue: MenuIssue?
   private var started = false
   private var recoveryPending = false
+  private var closedLidPreferenceNeedsMigration = false
 
   override convenience init() {
     self.init(startsAutomatically: true)
@@ -52,7 +53,7 @@ final class AppController: NSObject {
     let defaults = UserDefaults.standard
     LegacyPreferencesMigrator(defaults: defaults).migrate()
     let protectionStore = ProtectionPreferenceStore(defaults: defaults)
-    let closedLidEnabled = protectionStore.loadClosedLidEnabled()
+    let closedLidEnabled = protectionStore.loadClosedLidPreference() ?? false
     self.init(
       defaults: defaults,
       backend: CombinedSleepProtectionBackend(
@@ -101,6 +102,9 @@ final class AppController: NSObject {
     self.protectionStore = protectionStore
     self.backend = backend
     closedLidProtection = backend as? any ClosedLidProtectionManaging
+    closedLidPreferenceNeedsMigration =
+      closedLidProtection != nil
+      && protectionStore.loadClosedLidPreference() == nil
     backendWorker = SleepProtectionWorker(backend: backend)
     self.batteryStatusProvider = batteryStatusProvider
     self.codexActivityProvider = codexActivityProvider
@@ -132,7 +136,7 @@ final class AppController: NSObject {
 
   var closedLidMenuTitle: String? {
     guard closedLidProtection != nil else { return nil }
-    return isClosedLidEnabled ? "Don't Use with Lid Closed" : "Use with Lid Closed…"
+    return "Keep Awake with Lid Closed"
   }
 
   func start() {
@@ -140,7 +144,7 @@ final class AppController: NSObject {
     started = true
 
     if let launchAtLoginError = launchAtLoginController.enableByDefault() {
-      NSLog("Codex Not Sleep launch-at-login setup failed: %@", launchAtLoginError)
+      NSLog("Codexetine launch-at-login setup failed: %@", launchAtLoginError)
     }
 
     batteryStatusProvider.startMonitoring { [weak self] in
@@ -226,6 +230,8 @@ final class AppController: NSObject {
       enableClosedLidProtection()
     case .sleepRestoreRequired:
       restoreSleepFromMenu()
+    case .closedLidRecoveryRequired:
+      restoreClosedLidFromMenu()
     }
   }
 
@@ -264,8 +270,7 @@ final class AppController: NSObject {
           removeTerminationObserver()
           NSApplication.shared.terminate(nil)
         case .failure(let error):
-          recoveryPending = true
-          menuIssue = .sleepRestoreRequired
+          handleFailedQuit(error)
           logHiddenError("restore sleep before quit", error: error)
         }
       }
@@ -277,8 +282,7 @@ final class AppController: NSObject {
         removeTerminationObserver()
         NSApplication.shared.terminate(nil)
       } catch {
-        menuIssue = .sleepRestoreRequired
-        recoveryPending = true
+        handleFailedQuit(error)
         logHiddenError("restore sleep before quit", error: error)
       }
     }
@@ -296,9 +300,22 @@ final class AppController: NSObject {
       recoveryPending = false
       backendHeld = usesBackgroundSystemWork ? false : backend.isHeld
       menuIssue = nil
-      if isProtectionEnabled { startActivityMonitoring() }
-      requestEvaluation()
+      if closedLidPreferenceNeedsMigration {
+        migrateClosedLidPreference()
+      } else {
+        if isProtectionEnabled { startActivityMonitoring() }
+        requestEvaluation()
+      }
     case .failure(let error):
+      if error is ClosedLidProtectionError {
+        recoveryPending = false
+        backendHeld = backend.isHeld
+        menuIssue = .closedLidRecoveryRequired
+        if isProtectionEnabled { startActivityMonitoring() }
+        requestEvaluation()
+        logHiddenError("recover optional closed-lid protection", error: error)
+        return
+      }
       graceDeadlineScheduler.cancel()
       recoveryPending = true
       phase = .idle
@@ -619,8 +636,19 @@ final class AppController: NSObject {
       }
     case .failure(let error):
       if operation == .release {
-        menuIssue = .sleepRestoreRequired
+        backendHeld = backend.isHeld
+        menuIssue =
+          error is ClosedLidProtectionError
+          ? .closedLidRecoveryRequired
+          : .sleepRestoreRequired
         logHiddenError("restore sleep", error: error)
+      } else if error is ClosedLidProtectionError {
+        // The mandatory IOPM layer remains held when the optional closed-lid
+        // layer fails. Keep evaluating it and surface only the optional issue.
+        backendHeld = true
+        lastBackendRenewAt = now()
+        menuIssue = .closedLidRecoveryRequired
+        logHiddenError("activate optional closed-lid protection", error: error)
       } else {
         let activationIssue: MenuIssue? =
           (error as? PowerProtectError) == .setupRequired
@@ -666,15 +694,41 @@ final class AppController: NSObject {
       }
     }
 
-    // This is an explicit recovery action. Run setup verification off the
-    // main actor before attempting a release, because an old lease may remain
-    // after the sudoers rule was removed.
-    prepareBackend { [weak self] result in
+    // Ordinary IOPM recovery must not invoke privileged closed-lid setup.
+    release()
+  }
+
+  private func restoreClosedLidFromMenu() {
+    isResolvingIssue = true
+    let finish: @MainActor @Sendable (Result<Void, Error>) -> Void = { [weak self] result in
       guard let self else { return }
+      isResolvingIssue = false
       switch result {
-      case .success: release()
-      case .failure(let error): finishMenuRecovery(.failure(error))
+      case .success:
+        recoveryPending = false
+        backendHeld = backend.isHeld
+        menuIssue = nil
+        if isProtectionEnabled {
+          startActivityMonitoring()
+          requestEvaluation()
+        }
+      case .failure(let error):
+        menuIssue = .closedLidRecoveryRequired
+        logHiddenError("restore closed-lid protection from menu", error: error)
       }
+    }
+
+    if usesBackgroundSystemWork {
+      backendWorker.releaseClosedLid(completion: finish)
+    } else if let releaser = backend as? any ClosedLidProtectionReleasing {
+      do {
+        try releaser.releaseClosedLid()
+        finish(.success(()))
+      } catch {
+        finish(.failure(error))
+      }
+    } else {
+      finish(.success(()))
     }
   }
 
@@ -695,13 +749,61 @@ final class AppController: NSObject {
     case .failure(let error):
       graceDeadlineScheduler.cancel()
       pendingActivationIssue = nil
-      menuIssue = .sleepRestoreRequired
+      menuIssue =
+        error is ClosedLidProtectionError
+        ? .closedLidRecoveryRequired
+        : .sleepRestoreRequired
       logHiddenError("restore sleep from menu", error: error)
     }
   }
 
+  private func migrateClosedLidPreference() {
+    guard closedLidPreferenceNeedsMigration else { return }
+    closedLidPreferenceNeedsMigration = false
+    isPreparingClosedLid = true
+
+    let finish: @MainActor @Sendable (PowerProtectSetupState) -> Void = { [weak self] state in
+      guard let self else { return }
+      let enabled = state == .installedAndValid
+      closedLidProtection?.setClosedLidEnabled(enabled)
+      isClosedLidEnabled = enabled
+      protectionStore.saveClosedLidEnabled(enabled)
+      isPreparingClosedLid = false
+      if isProtectionEnabled { startActivityMonitoring() }
+      requestEvaluation()
+    }
+
+    if usesBackgroundSystemWork {
+      backendWorker.inspectClosedLidSetup(completion: finish)
+    } else {
+      finish((backend as? any ClosedLidProtectionInspecting)?.closedLidSetupState ?? .unavailable)
+    }
+  }
+
+  private func handleFailedQuit(_ error: Error) {
+    backendOperationInFlight = false
+    recoveryPending = false
+    backendHeld = backend.isHeld
+    menuIssue =
+      error is ClosedLidProtectionError
+      ? .closedLidRecoveryRequired
+      : .sleepRestoreRequired
+
+    // A failed quit is recoverable while the app remains alive. Re-arm every
+    // observer and the battery callback that quit temporarily stopped.
+    batteryStatusProvider.startMonitoring { [weak self] in
+      Task { @MainActor in
+        self?.requestEvaluation()
+      }
+    }
+    if isProtectionEnabled {
+      startActivityMonitoring()
+      requestEvaluation()
+    }
+  }
+
   private func logHiddenError(_ operation: String, error: Error) {
-    NSLog("Codex Not Sleep failed to %@: %@", operation, error.localizedDescription)
+    NSLog("Codexetine failed to %@: %@", operation, error.localizedDescription)
   }
 
   @objc

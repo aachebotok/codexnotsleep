@@ -9,7 +9,7 @@ swift build "${BUILD_ARGS[@]}"
 BIN_DIR="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)"
 STAGING_DIR="$(mktemp -d "/private/tmp/codexnotsleep-package.XXXXXX")"
 DMG_ROOT="$STAGING_DIR/dmg"
-STAGING_APP="$DMG_ROOT/Codex Not Sleep.app"
+STAGING_APP="$DMG_ROOT/Codexetine.app"
 
 cleanup() {
   rm -rf "$STAGING_DIR"
@@ -46,16 +46,16 @@ fi
 
 ln -s /Applications "$DMG_ROOT/Applications"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$STAGING_APP/Contents/Info.plist")"
-DMG_NAME="Codex-Not-Sleep-$VERSION.dmg"
+DMG_NAME="Codexetine-$VERSION.dmg"
 STAGING_DMG="$STAGING_DIR/$DMG_NAME"
 OUTPUT_DMG="$PROJECT_DIR/dist/$DMG_NAME"
-OUTPUT_APP="$PROJECT_DIR/dist/Codex Not Sleep.app"
+OUTPUT_APP="$PROJECT_DIR/dist/Codexetine.app"
 
 mkdir -p "$PROJECT_DIR/dist"
 rm -rf "$OUTPUT_APP"
 ditto "$STAGING_APP" "$OUTPUT_APP"
 hdiutil create \
-  -volname "Codex Not Sleep" \
+  -volname "Codexetine" \
   -srcfolder "$DMG_ROOT" \
   -format UDZO \
   -ov \

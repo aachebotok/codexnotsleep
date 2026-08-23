@@ -1,4 +1,4 @@
-# Codex Not Sleep contributor guide
+# Codexetine contributor guide
 
 ## Read first
 
@@ -10,7 +10,7 @@
 
 ## Product boundary
 
-Codex Not Sleep is a native macOS 13+ menu-bar utility with one primary job:
+Codexetine is a native macOS 13+ menu-bar utility with one primary job:
 
 > Keep the Mac awake while Codex is actively working, then reliably restore normal system sleep behavior afterward.
 
@@ -115,13 +115,13 @@ If the tree changes, update this map.
 - Closed-lid support is optional and may use privileged `pmset` state.
 - Normal open-lid protection must work without administrator privileges.
 - Privileged setup must be narrowly scoped and have essentially zero runtime cost while unused.
-- The optional `Use with Lid Closed…` action is the only normal path that requests
+- The optional `Keep Awake with Lid Closed` action is the only normal path that requests
   administrator setup; ordinary open-lid IOPM protection must remain independent.
 - Never broaden sudo privileges for convenience.
 
 Critical invariant:
 
-> Never restore or disable a global `SleepDisabled` state that Codex Not Sleep did not create.
+> Never restore or disable a global `SleepDisabled` state that Codexetine did not create.
 
 Preserve or strengthen lease ownership, inherited-state detection, stale-lease recovery, rollback, release/recovery behavior, and watchdog recovery where needed.
 

@@ -8,6 +8,6 @@ Contributions are welcome.
 4. Run `swift build -c release` and `./scripts/package.sh` for runtime or packaging changes.
 5. Open a pull request explaining what changed and why.
 
-Codex Not Sleep requires macOS 13 or later and a Swift 6 toolchain.
+Codexetine requires macOS 13 or later and a Swift 6 toolchain.
 
 The primary UI is a native `NSStatusItem`/`NSMenu`; avoid pixel-geometry tests for the menu. See [ARCHITECTURE.md](ARCHITECTURE.md) for monitoring, sleep-state ownership, and brightness invariants.

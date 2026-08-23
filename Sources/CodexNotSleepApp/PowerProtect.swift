@@ -37,10 +37,41 @@ enum PowerProtectSetupState: Equatable, Sendable {
   case unavailable
 }
 
+enum ClosedLidProtectionError: LocalizedError, Equatable {
+  case setupRequired
+  case acquisitionFailed
+  case renewalFailed
+  case releaseFailed
+  case recoveryFailed
+
+  var errorDescription: String? {
+    switch self {
+    case .setupRequired:
+      "Closed-lid protection needs one-time setup"
+    case .acquisitionFailed:
+      "Closed-lid protection could not be acquired"
+    case .renewalFailed:
+      "Closed-lid protection could not be renewed"
+    case .releaseFailed:
+      "Closed-lid protection could not be released"
+    case .recoveryFailed:
+      "Closed-lid protection could not be recovered"
+    }
+  }
+}
+
 protocol ClosedLidProtectionManaging: AnyObject {
   var isClosedLidEnabled: Bool { get }
   func setClosedLidEnabled(_ enabled: Bool)
   func prepareClosedLid() throws
+}
+
+protocol ClosedLidProtectionInspecting: AnyObject {
+  var closedLidSetupState: PowerProtectSetupState { get }
+}
+
+protocol ClosedLidProtectionReleasing: AnyObject {
+  func releaseClosedLid() throws
 }
 
 typealias PowerProtectCommandResult = BoundedProcessResult
@@ -126,7 +157,7 @@ struct PowerProtectRuleFileState: Equatable, Sendable {
 
 final class PowerProtectInstaller: PowerProtectInstalling {
   static let authorizationPrompt =
-    "Allow Codex Not Sleep to keep your Mac running with the lid closed. You'll only need to confirm once."
+    "Allow Codexetine to keep your Mac running with the lid closed. You'll only need to confirm once."
 
   static var authorizationPreviewAppleScript: String {
     "do shell script \"/usr/bin/true\" with prompt \"\(authorizationPrompt)\" with administrator privileges"
@@ -277,12 +308,13 @@ protocol PowerProtectWatchdogControlling: AnyObject {
 
 final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
   private var process: Process?
+  private var parentWriteHandle: FileHandle?
 
   func start(parentPID: Int32, leaseURL: URL, token: String) throws {
     stop()
 
     let process = Process()
-    process.executableURL = URL(filePath: "/bin/sh")
+    process.executableURL = URL(filePath: "/bin/bash")
     process.arguments = ["-c", Self.watchdogScript]
     process.environment = [
       "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -293,8 +325,10 @@ final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
       "CNS_LEASE_TOKEN": token,
     ]
     let readinessPipe = Pipe()
+    let parentPipe = Pipe()
     process.standardOutput = readinessPipe
     process.standardError = FileHandle.nullDevice
+    process.standardInput = parentPipe.fileHandleForReading
 
     do {
       try process.run()
@@ -304,15 +338,20 @@ final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
       )
       guard readiness == Data("ready\n".utf8), process.isRunning else {
         BoundedProcessTermination.stop(process)
+        try? parentPipe.fileHandleForWriting.close()
         throw PowerProtectError.watchdogFailed
       }
       self.process = process
+      self.parentWriteHandle = parentPipe.fileHandleForWriting
     } catch {
+      try? parentPipe.fileHandleForWriting.close()
       throw PowerProtectError.watchdogFailed
     }
   }
 
   func stop() {
+    try? parentWriteHandle?.close()
+    parentWriteHandle = nil
     guard let process else { return }
     BoundedProcessTermination.stop(process)
     self.process = nil
@@ -332,9 +371,9 @@ final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
   static let watchdogScript =
     """
     /usr/bin/printf 'ready\n'
-    while /bin/kill -0 "$CNS_PARENT_PID" 2>/dev/null; do
-      /bin/sleep 1
-    done
+    # Parent liveness is authorized by EOF on the inherited pipe. The parent
+    # PID is diagnostic metadata only and is never used for restoration.
+    /bin/cat </dev/stdin >/dev/null
     run_bounded() {
       directory=$(/usr/bin/mktemp -d "${CNS_LEASE_PATH}.watchdog.XXXXXX") || return 124
       "$@" >"$directory/output" 2>/dev/null &
@@ -358,6 +397,9 @@ final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
       /bin/rm -rf "$directory"
       return "$status"
     }
+    retry_count=0
+    maximum_retries=6
+    retry_delay=0.25
     while [ "$(/bin/cat "$CNS_LEASE_PATH" 2>/dev/null)" = "$CNS_LEASE_TOKEN" ]; do
       current=$(run_bounded /usr/bin/pmset -g | /usr/bin/awk '$1 == "SleepDisabled" { print $2; exit }') || current=""
       if [ "$current" = "0" ]; then
@@ -370,7 +412,20 @@ final class ProcessPowerProtectWatchdog: PowerProtectWatchdogControlling {
         /bin/rm -f "$CNS_LEASE_PATH"
         exit 0
       fi
-      /bin/sleep 2
+      if [ "$retry_count" -ge "$maximum_retries" ]; then
+        # Keep the lease for explicit recovery when the finite retry budget is
+        # exhausted; never authorize an unbounded restoration loop.
+        exit 75
+      fi
+      retry_count=$((retry_count + 1))
+      /bin/sleep "$retry_delay"
+      case "$retry_delay" in
+        0.25) retry_delay=0.5 ;;
+        0.5) retry_delay=1 ;;
+        1) retry_delay=2 ;;
+        2) retry_delay=4 ;;
+        *) retry_delay=5 ;;
+      esac
     done
     """
 }
@@ -417,10 +472,13 @@ final class PowerProtectLeaseStore {
   }
 }
 
-final class PMSetPowerProtectBackend: SleepProtectionBackend, ClosedLidProtectionManaging {
+final class PMSetPowerProtectBackend: SleepProtectionBackend,
+  ClosedLidProtectionManaging, ClosedLidProtectionInspecting, ClosedLidProtectionReleasing
+{
   let identifier = "pmset closed-lid protection"
   private(set) var isHeld: Bool
   private(set) var isClosedLidEnabled: Bool
+  var closedLidSetupState: PowerProtectSetupState { installer.setupState }
 
   // Presence is cheap and safe during app startup. Semantic permission
   // verification is deferred to the worker that performs acquire/release.
@@ -537,6 +595,10 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend, ClosedLidProtectio
     try restoreSleep()
   }
 
+  func releaseClosedLid() throws {
+    try release()
+  }
+
   private func restoreSleep() throws {
     do {
       if try sleepIsDisabled() {
@@ -589,7 +651,9 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend, ClosedLidProtectio
     PowerProtectAuthorizationEnvironment.sanitized(ProcessInfo.processInfo.environment)
 }
 
-final class CombinedSleepProtectionBackend: SleepProtectionBackend, ClosedLidProtectionManaging {
+final class CombinedSleepProtectionBackend: SleepProtectionBackend,
+  ClosedLidProtectionManaging, ClosedLidProtectionInspecting, ClosedLidProtectionReleasing
+{
   let identifier = "IOPM + pmset closed-lid protection"
   var isHeld: Bool { idleSleep.isHeld || closedLid.isHeld }
   // Closed-lid support is optional. Ordinary IOPM protection never requires
@@ -597,6 +661,9 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend, ClosedLidPro
   var requiresSetup: Bool { false }
   var isClosedLidEnabled: Bool {
     (closedLid as? any ClosedLidProtectionManaging)?.isClosedLidEnabled ?? true
+  }
+  var closedLidSetupState: PowerProtectSetupState {
+    (closedLid as? any ClosedLidProtectionInspecting)?.closedLidSetupState ?? .unavailable
   }
 
   private let idleSleep: any SleepProtectionBackend
@@ -627,8 +694,19 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend, ClosedLidPro
   }
 
   func recover() throws {
-    try closedLid.recover()
+    var closedLidError: Error?
+    do {
+      try closedLid.recover()
+    } catch {
+      closedLidError = ClosedLidProtectionError.recoveryFailed
+    }
+
+    // Recovery of ordinary IOPM protection is independent. A stale or broken
+    // optional closed-lid lease must never prevent this recovery path.
     try idleSleep.recover()
+    if let closedLidError {
+      throw closedLidError
+    }
   }
 
   func acquire() throws {
@@ -637,19 +715,12 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend, ClosedLidPro
     do {
       try closedLid.acquire()
     } catch {
-      let activationError = error
-      do {
-        try idleSleep.release()
-      } catch {
-        throw error
-      }
-      throw activationError
+      throw Self.closedLidError(for: .acquisitionFailed, underlying: error)
     }
   }
 
   func renew() throws {
-    let acquiredIdleSleep = !idleSleep.isHeld
-    if acquiredIdleSleep {
+    if !idleSleep.isHeld {
       try idleSleep.acquire()
     } else {
       try idleSleep.renew()
@@ -663,33 +734,65 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend, ClosedLidPro
           try closedLid.acquire()
         }
       } catch {
-        let renewalError = error
-        if acquiredIdleSleep {
-          do {
-            try idleSleep.release()
-          } catch {
-            throw error
-          }
-        }
-        throw renewalError
+        throw Self.closedLidError(for: .renewalFailed, underlying: error)
       }
     } else if closedLid.isHeld {
-      try closedLid.release()
+      do {
+        try closedLid.release()
+      } catch {
+        throw Self.closedLidError(for: .releaseFailed, underlying: error)
+      }
     }
   }
 
   func release() throws {
     var firstError: Error?
+
+    // Release the mandatory IOPM layer first. If the optional layer fails,
+    // ordinary sleep protection still has a durable release path.
     do {
-      try closedLid.release()
+      try idleSleep.release()
     } catch {
       firstError = error
     }
     do {
-      try idleSleep.release()
+      try closedLid.release()
     } catch {
-      if firstError == nil { firstError = error }
+      if firstError == nil {
+        firstError = Self.closedLidError(for: .releaseFailed, underlying: error)
+      }
     }
     if let firstError { throw firstError }
+  }
+
+  func releaseClosedLid() throws {
+    do {
+      try closedLid.release()
+    } catch {
+      throw Self.closedLidError(for: .releaseFailed, underlying: error)
+    }
+  }
+
+  private enum ClosedLidOperation {
+    case acquisitionFailed
+    case renewalFailed
+    case releaseFailed
+  }
+
+  private static func closedLidError(
+    for operation: ClosedLidOperation,
+    underlying: Error
+  ) -> ClosedLidProtectionError {
+    if (underlying as? PowerProtectError) == .setupRequired {
+      return .setupRequired
+    }
+    switch operation {
+    case .acquisitionFailed:
+      return .acquisitionFailed
+    case .renewalFailed:
+      return .renewalFailed
+    case .releaseFailed:
+      return .releaseFailed
+    }
   }
 }
