@@ -81,6 +81,26 @@ struct CodexLifecycleParserTests {
     let parsed = CodexLifecycleParser.events(in: data)
     #expect(parsed.malformed)
   }
+
+  @Test
+  func lifecycleKeysAfterLargeUnrelatedFieldRemainSemantic() throws {
+    let line = Data(
+      (#"{"prefix":""#
+        + String(repeating: "x", count: 8 * 1_024)
+        + #"","payload":{"type":"turn_started","turn_id":"late"},"type":"event_msg"}"#)
+        .utf8
+    )
+
+    let event = try #require(CodexLifecycleParser.parse(line).event)
+    #expect(event.kind == .started)
+    #expect(event.turnID == "late")
+  }
+
+  @Test
+  func oversizedLifecycleRecordHasExplicitConservativeClassification() {
+    let line = Data(repeating: 0x78, count: CodexLifecycleParser.maximumSupportedLineBytes + 1)
+    #expect(CodexLifecycleParser.parse(line) == .oversizedRecord)
+  }
 }
 
 @Suite
@@ -456,10 +476,28 @@ struct CodexSessionActivityMonitorTests {
     try fixture.append(largeNoise + complete("A"), to: file)
 
     #expect(monitor.refresh() == .active(turnCount: 1))
+    #expect(monitor.hasPendingWork)
     for _ in 0..<8 where monitor.snapshot != .idle {
       _ = monitor.refresh()
     }
     #expect(monitor.snapshot == .idle)
+    #expect(!monitor.hasPendingWork)
+  }
+
+  @Test
+  func giantNewlineFreeTailBootstrapsAtBoundedSafeOffset() throws {
+    let fixture = try SessionFixture()
+    let file = try fixture.makeRootSession(events: [])
+    try fixture.append(
+      Data(repeating: 0x78, count: 64 * 1_024 * 1_024 + 1),
+      to: file
+    )
+    let locator = FakeCodexOpenSessionLocator(files: [owned(file)])
+    let monitor = CodexSessionActivityMonitor(locator: locator)
+
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
+    #expect(!monitor.hasPendingWork)
+    #expect(monitor.refresh() == .unavailable(protectConservatively: true))
   }
 
   @Test
@@ -609,16 +647,79 @@ struct CodexSessionActivityMonitorTests {
   }
 
   @Test
+  func repeatedWritesToKnownSessionAvoidProcessAndFDCorrelation() throws {
+    let fixture = try SessionFixture()
+    let runtimeStartedAt = Date(timeIntervalSince1970: 3_000)
+    let file = try fixture.makeRootSession(events: [start("known", startedAt: 3_100)])
+    let observer = FakeCodexSessionFileChangeObserver()
+    let inspector = FakeCodexProcessInspector(
+      processes: [CodexRuntimeProcess(processID: 101, startedAt: runtimeStartedAt)],
+      pathsByProcessID: [101: [file.path]],
+      unreadableProcessIDs: []
+    )
+    let locator = LibprocCodexOpenSessionLocator(
+      sessionRoot: fixture.directory,
+      userID: 501,
+      processInspector: inspector,
+      minimumDiscoveryInterval: 10_000,
+      now: { Date(timeIntervalSince1970: 3_200) },
+      changeObserver: observer
+    )
+    let monitor = CodexSessionActivityMonitor(locator: locator)
+
+    #expect(monitor.refresh() == .active(turnCount: 1))
+    let processScans = locator.metrics.processTableScans
+    let descriptorScans = locator.metrics.fileDescriptorScans
+
+    try fixture.append(complete("known"), to: file)
+    observer.changes.paths.insert(file.path)
+    #expect(monitor.refresh() == .idle)
+    #expect(locator.metrics.processTableScans == processScans)
+    #expect(locator.metrics.fileDescriptorScans == descriptorScans)
+  }
+
+  @Test
+  func discoveredSessionCandidatesAndTrackedStateAreBounded() throws {
+    let fixture = try SessionFixture()
+    let runtimeStartedAt = Date(timeIntervalSince1970: 3_000)
+    for index in 0..<400 {
+      _ = try fixture.makeRootSession(name: "historical-\(index)", events: [])
+    }
+    let active = try fixture.makeRootSession(events: [start("active")])
+    try fixture.setModificationDate(Date(timeIntervalSince1970: 9_000), for: active)
+    let inspector = FakeCodexProcessInspector(
+      processes: [CodexRuntimeProcess(processID: 101, startedAt: runtimeStartedAt)],
+      pathsByProcessID: [101: []],
+      unreadableProcessIDs: []
+    )
+    let locator = LibprocCodexOpenSessionLocator(
+      sessionRoot: fixture.directory,
+      userID: 501,
+      processInspector: inspector,
+      minimumDiscoveryInterval: 0,
+      now: { Date(timeIntervalSince1970: 9_100) }
+    )
+    let monitor = CodexSessionActivityMonitor(locator: locator)
+
+    #expect(monitor.refresh().effectiveActiveCount == 1)
+    #expect(locator.metrics.discoveredPathCount <= 256)
+    #expect(monitor.metrics.trackedStateCount <= 256)
+    #expect(locator.metrics.discoveredPathCount > 0)
+  }
+
+  @Test
   func fileSystemObserverReportsAChangedSessionFile() async throws {
     let fixture = try SessionFixture()
     let observer = FSEventsCodexSessionFileChangeObserver(sessionRoot: fixture.directory)
-    observer.start { }
+    observer.start {}
     defer { observer.stop() }
     let file = try fixture.makeRootSession(events: [start("background")])
     var observedPaths = Set<String>()
 
     for _ in 0..<40
-    where !observedPaths.contains(where: { URL(fileURLWithPath: $0).lastPathComponent == file.lastPathComponent }) {
+    where !observedPaths.contains(where: {
+      URL(fileURLWithPath: $0).lastPathComponent == file.lastPathComponent
+    }) {
       try await Task.sleep(for: .milliseconds(50))
       observedPaths.formUnion(observer.takeChanges().paths)
     }
@@ -628,6 +729,59 @@ struct CodexSessionActivityMonitorTests {
         URL(fileURLWithPath: $0).lastPathComponent == file.lastPathComponent
       }
     )
+  }
+
+  @Test
+  func rootChangeRequiresRecoveryAndObserverUsesRootWatch() {
+    #expect(
+      FSEventsCodexSessionFileChangeObserver.requiresFullScan(
+        for: FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged)
+      ))
+    #expect(FSEventsObserverConfiguration.current.usesNoDefer)
+  }
+
+  @Test
+  func optInFSEventsConfigurationMeasurement() async throws {
+    guard ProcessInfo.processInfo.environment["CODEX_NOT_SLEEP_MEASURE_FSEVENTS"] == "1" else {
+      return
+    }
+
+    let configurations = [
+      ("A", FSEventsObserverConfiguration(latency: 0.1, usesNoDefer: true)),
+      ("B", FSEventsObserverConfiguration(latency: 0.25, usesNoDefer: false)),
+    ]
+    for (name, configuration) in configurations {
+      let fixture = try SessionFixture()
+      let observer = FSEventsCodexSessionFileChangeObserver(
+        sessionRoot: fixture.directory,
+        configuration: configuration
+      )
+      observer.start {}
+      defer { observer.stop() }
+
+      let file = try fixture.makeRootSession(events: [start("measure")])
+      let creationStart = Date.now
+      while observer.takeChanges().paths.isEmpty,
+        Date.now.timeIntervalSince(creationStart) < 2
+      {
+        try await Task.sleep(for: .milliseconds(20))
+      }
+      let creationLatency = Date.now.timeIntervalSince(creationStart)
+
+      let completionStart = Date.now
+      try fixture.append(complete("measure"), to: file)
+      while observer.takeChanges().paths.isEmpty,
+        Date.now.timeIntervalSince(completionStart) < 2
+      {
+        try await Task.sleep(for: .milliseconds(20))
+      }
+      let completionLatency = Date.now.timeIntervalSince(completionStart)
+      print(
+        "FSEvents " + name
+          + ": creation=\(creationLatency)s completion=\(completionLatency)s callbacks=\(observer.observedCallbackCount)"
+      )
+      observer.stop()
+    }
   }
 
   @Test
@@ -774,10 +928,14 @@ private final class SessionFixture {
   }
 
   func append(_ value: String, to url: URL) throws {
+    try append(Data(value.utf8), to: url)
+  }
+
+  func append(_ data: Data, to url: URL) throws {
     let handle = try FileHandle(forWritingTo: url)
     defer { try? handle.close() }
     try handle.seekToEnd()
-    try handle.write(contentsOf: Data(value.utf8))
+    try handle.write(contentsOf: data)
   }
 
   func replaceRootSession(at url: URL, events: [String]) throws {

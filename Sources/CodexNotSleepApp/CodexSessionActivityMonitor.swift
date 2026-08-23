@@ -1,5 +1,5 @@
-import Darwin
 import CoreServices
+import Darwin
 import Foundation
 
 enum CodexActivitySnapshot: Equatable, Sendable {
@@ -26,6 +26,7 @@ enum CodexActivitySnapshot: Equatable, Sendable {
 
 protocol CodexActivityProviding: AnyObject {
   var snapshot: CodexActivitySnapshot { get }
+  var hasPendingWork: Bool { get }
 
   @discardableResult
   func refresh() -> CodexActivitySnapshot
@@ -39,6 +40,7 @@ protocol CodexActivityProviding: AnyObject {
 }
 
 extension CodexActivityProviding {
+  var hasPendingWork: Bool { false }
   func reset() {}
   func startMonitoring(onChange: @escaping @Sendable () -> Void) {}
   func stopMonitoring() {}
@@ -80,9 +82,32 @@ enum CodexOpenSessionLocatorError: LocalizedError {
   }
 }
 
+struct CodexLocatorMetrics: Equatable, Sendable {
+  var processTableScans = 0
+  var fileDescriptorScans = 0
+  var directoryScans = 0
+  var discoveredPathCount = 0
+}
+
+struct CodexMonitorMetrics: Equatable, Sendable {
+  var refreshes = 0
+  var lifecycleChunkReads = 0
+  var trackedStateCount = 0
+}
+
 struct CodexSessionFileChanges {
   var paths = Set<String>()
   var requiresFullScan = false
+}
+
+struct FSEventsObserverConfiguration: Equatable, Sendable {
+  let latency: TimeInterval
+  let usesNoDefer: Bool
+
+  static let current = FSEventsObserverConfiguration(
+    latency: 0.1,
+    usesNoDefer: true
+  )
 }
 
 protocol CodexSessionFileChangeObserving: AnyObject {
@@ -94,20 +119,33 @@ private protocol CodexSessionFileChangeNotifying: AnyObject {
   func stop()
 }
 
-final class FSEventsCodexSessionFileChangeObserver:
+final class FSEventsCodexSessionFileChangeObserver: @unchecked Sendable,
   CodexSessionFileChangeObserving, CodexSessionFileChangeNotifying
 {
   private let lock = NSLock()
+  private let sessionRoot: URL
+  private let configuration: FSEventsObserverConfiguration
   private let queue = DispatchQueue(
     label: "app.codexnotsleep.codex-session-events",
     qos: .utility
   )
   private var pendingChanges = CodexSessionFileChanges()
+  private var callbackCount = 0
   private var stream: FSEventStreamRef?
   private var changeHandler: (@Sendable () -> Void)?
   private var isStarted = false
 
-  init(sessionRoot: URL) {
+  init(
+    sessionRoot: URL,
+    configuration: FSEventsObserverConfiguration = .current
+  ) {
+    self.sessionRoot = sessionRoot
+    self.configuration = configuration
+    stream = nil
+    createStream()
+  }
+
+  private func createStream() {
     var context = FSEventStreamContext(
       version: 0,
       info: Unmanaged.passUnretained(self).toOpaque(),
@@ -115,17 +153,20 @@ final class FSEventsCodexSessionFileChangeObserver:
       release: nil,
       copyDescription: nil
     )
-    let flags =
+    var flags =
       FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes)
       | FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents)
-      | FSEventStreamCreateFlags(kFSEventStreamCreateFlagNoDefer)
+      | FSEventStreamCreateFlags(kFSEventStreamCreateFlagWatchRoot)
+    if configuration.usesNoDefer {
+      flags |= FSEventStreamCreateFlags(kFSEventStreamCreateFlagNoDefer)
+    }
     stream = FSEventStreamCreate(
       kCFAllocatorDefault,
       Self.callback,
       &context,
       [sessionRoot.path] as CFArray,
       FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-      0.1,
+      configuration.latency,
       flags
     )
     guard let stream = self.stream else {
@@ -175,6 +216,21 @@ final class FSEventsCodexSessionFileChangeObserver:
     }
   }
 
+  var observedCallbackCount: Int {
+    lock.withLock { callbackCount }
+  }
+
+  static func requiresFullScan(for flags: FSEventStreamEventFlags) -> Bool {
+    flags
+      & FSEventStreamEventFlags(
+        kFSEventStreamEventFlagMustScanSubDirs
+          | kFSEventStreamEventFlagUserDropped
+          | kFSEventStreamEventFlagKernelDropped
+          | kFSEventStreamEventFlagEventIdsWrapped
+          | kFSEventStreamEventFlagRootChanged
+      ) != 0
+  }
+
   private func receive(
     paths: [String],
     flags: UnsafePointer<FSEventStreamEventFlags>,
@@ -182,17 +238,10 @@ final class FSEventsCodexSessionFileChangeObserver:
   ) {
     var handler: (@Sendable () -> Void)?
     lock.withLock {
+      callbackCount += 1
       for index in 0..<count {
         let eventFlags = flags[index]
-        if eventFlags
-          & FSEventStreamEventFlags(
-            kFSEventStreamEventFlagMustScanSubDirs
-              | kFSEventStreamEventFlagUserDropped
-              | kFSEventStreamEventFlagKernelDropped
-              | kFSEventStreamEventFlagEventIdsWrapped
-              | kFSEventStreamEventFlagRootChanged
-          ) != 0
-        {
+        if Self.requiresFullScan(for: eventFlags) {
           pendingChanges.requiresFullScan = true
         }
         if index < paths.count {
@@ -202,6 +251,33 @@ final class FSEventsCodexSessionFileChangeObserver:
       handler = changeHandler
     }
     handler?()
+    if Self.requiresRootRestart(flags: flags, count: count) {
+      queue.async { [weak self] in self?.restartStream() }
+    }
+  }
+
+  private static func requiresRootRestart(
+    flags: UnsafePointer<FSEventStreamEventFlags>,
+    count: Int
+  ) -> Bool {
+    (0..<count).contains {
+      flags[$0] & FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged) != 0
+    }
+  }
+
+  private func restartStream() {
+    guard isStarted else { return }
+    if let stream {
+      FSEventStreamStop(stream)
+      FSEventStreamInvalidate(stream)
+      FSEventStreamRelease(stream)
+      self.stream = nil
+    }
+    createStream()
+    guard let stream, FSEventStreamStart(stream) else {
+      lock.withLock { pendingChanges.requiresFullScan = true }
+      return
+    }
   }
 
   private static let callback: FSEventStreamCallback = {
@@ -225,8 +301,10 @@ protocol CodexOpenSessionEventSource: AnyObject {
 }
 
 final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenSessionEventSource {
-  private static let discoveryInterval: TimeInterval = 30
+  private static let discoveryInterval: TimeInterval = 5 * 60
   private static let processStartTolerance: TimeInterval = 5
+  private static let maximumDiscoveredPaths = 256
+  private static let discoveredPathLifetime: TimeInterval = 30 * 60
 
   private let sessionRoot: URL
   private let userID: uid_t
@@ -235,10 +313,12 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
   private let minimumDiscoveryInterval: TimeInterval
   private let now: () -> Date
   private let changeObserver: any CodexSessionFileChangeObserving
-  private var discoveredPaths = Set<String>()
+  private var discoveredPaths: [String: Date] = [:]
   private var discoveryWasReliable = true
   private var discoveredForRuntimeStartedAt: Date?
   private var lastDiscoveryAt = Date.distantPast
+  private var cachedInventory: CodexOpenSessionInventory?
+  private(set) var metrics = CodexLocatorMetrics()
 
   init(
     sessionRoot: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -261,22 +341,33 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
   }
 
   func locateOpenSessions() throws -> CodexOpenSessionInventory {
+    let changes = changeObserver.takeChanges()
+    if let cachedInventory, canUseCachedInventory(for: changes) {
+      let inventory = inventoryAfterKnownFileChanges(cachedInventory, changes: changes)
+      self.cachedInventory = inventory
+      return inventory
+    }
+
+    metrics.processTableScans += 1
     guard let codexProcesses = processInspector.currentUserCodexProcesses(userID: userID) else {
       throw CodexOpenSessionLocatorError.processInventoryUnavailable
     }
     guard !codexProcesses.isEmpty else {
       resetDiscovery()
-      return CodexOpenSessionInventory(hasCodexRuntime: false, files: [], isReliable: true)
+      let inventory = CodexOpenSessionInventory(hasCodexRuntime: false, files: [], isReliable: true)
+      cachedInventory = inventory
+      return inventory
     }
 
     let runtimeStartedAt = codexProcesses.map(\.startedAt).min() ?? .distantPast
-    applyFileChanges(runtimeStartedAt: runtimeStartedAt)
+    applyFileChanges(changes, runtimeStartedAt: runtimeStartedAt)
     refreshDiscoveredPathsIfNeeded(runtimeStartedAt: runtimeStartedAt)
 
     var ownersByPath: [String: Date] = [:]
     var readableProcessCount = 0
 
     for process in codexProcesses {
+      metrics.fileDescriptorScans += 1
       guard let paths = processInspector.openFilePaths(processID: process.processID) else {
         continue
       }
@@ -291,7 +382,7 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
       }
     }
 
-    for path in discoveredPaths {
+    for path in discoveredPaths.keys {
       if let existing = ownersByPath[path] {
         ownersByPath[path] = min(existing, runtimeStartedAt)
       } else {
@@ -307,11 +398,13 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
     }
     .sorted { $0.url.path < $1.url.path }
 
-    return CodexOpenSessionInventory(
+    let inventory = CodexOpenSessionInventory(
       hasCodexRuntime: true,
       files: files,
       isReliable: readableProcessCount == codexProcesses.count && discoveryWasReliable
     )
+    cachedInventory = inventory
+    return inventory
   }
 
   func startMonitoring(onChange: @escaping @Sendable () -> Void) {
@@ -322,11 +415,43 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
     (changeObserver as? CodexSessionFileChangeNotifying)?.stop()
   }
 
-  private func applyFileChanges(runtimeStartedAt: Date) {
-    let changes = changeObserver.takeChanges()
+  private func canUseCachedInventory(for changes: CodexSessionFileChanges) -> Bool {
+    guard let cachedInventory, cachedInventory.hasCodexRuntime else { return false }
+    guard !changes.requiresFullScan, !changes.paths.isEmpty else { return false }
+    let knownPaths = Set(cachedInventory.files.map { $0.url.standardizedFileURL.path })
+    return changes.paths.allSatisfy { path in
+      let normalizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
+      return isSessionJSONL(normalizedPath) && knownPaths.contains(normalizedPath)
+    }
+  }
+
+  private func inventoryAfterKnownFileChanges(
+    _ inventory: CodexOpenSessionInventory,
+    changes: CodexSessionFileChanges
+  ) -> CodexOpenSessionInventory {
+    let deletedPaths = Set(
+      changes.paths
+        .map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        .filter { !fileManager.fileExists(atPath: $0) }
+    )
+    guard !deletedPaths.isEmpty else { return inventory }
+    return CodexOpenSessionInventory(
+      hasCodexRuntime: inventory.hasCodexRuntime,
+      files: inventory.files.filter {
+        !deletedPaths.contains($0.url.standardizedFileURL.path)
+      },
+      isReliable: inventory.isReliable
+    )
+  }
+
+  private func applyFileChanges(
+    _ changes: CodexSessionFileChanges,
+    runtimeStartedAt: Date
+  ) {
     if changes.requiresFullScan {
       lastDiscoveryAt = .distantPast
     }
+    let currentTime = now()
     let cutoff = runtimeStartedAt.addingTimeInterval(-Self.processStartTolerance)
     for path in changes.paths where isSessionJSONL(path) {
       let url = URL(fileURLWithPath: path).standardizedFileURL
@@ -338,18 +463,20 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
           let modifiedAt = values.contentModificationDate,
           modifiedAt >= cutoff
         {
-          discoveredPaths.insert(url.path)
+          discoveredPaths[url.path] = currentTime
         } else {
-          discoveredPaths.remove(url.path)
+          discoveredPaths.removeValue(forKey: url.path)
         }
       } catch {
         if !fileManager.fileExists(atPath: url.path) {
-          discoveredPaths.remove(url.path)
+          discoveredPaths.removeValue(forKey: url.path)
         } else {
           discoveryWasReliable = false
         }
       }
     }
+    trimDiscoveredPaths(at: currentTime)
+    metrics.discoveredPathCount = discoveredPaths.count
   }
 
   private func refreshDiscoveredPathsIfNeeded(runtimeStartedAt: Date) {
@@ -362,8 +489,9 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
 
     let cutoff = runtimeStartedAt.addingTimeInterval(-Self.processStartTolerance)
     let resourceKeys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
-    var paths = Set<String>()
+    var paths: [String: Date] = [:]
     var wasReliable = true
+    metrics.directoryScans += 1
     let enumerator = fileManager.enumerator(
       at: sessionRoot,
       includingPropertiesForKeys: resourceKeys,
@@ -383,7 +511,7 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
             let modifiedAt = values.contentModificationDate,
             modifiedAt >= cutoff
           else { continue }
-          paths.insert(url.standardizedFileURL.path)
+          paths[url.standardizedFileURL.path] = modifiedAt
         } catch {
           wasReliable = false
         }
@@ -392,7 +520,13 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
       wasReliable = false
     }
 
-    discoveredPaths = paths
+    discoveredPaths =
+      paths
+      .filter { currentTime.timeIntervalSince($0.value) < Self.discoveredPathLifetime }
+      .sorted { $0.value > $1.value }
+      .prefix(Self.maximumDiscoveredPaths)
+      .reduce(into: [:]) { $0[$1.key] = $1.value }
+    metrics.discoveredPathCount = discoveredPaths.count
     discoveryWasReliable = wasReliable
     discoveredForRuntimeStartedAt = runtimeStartedAt
     lastDiscoveryAt = currentTime
@@ -403,6 +537,18 @@ final class LibprocCodexOpenSessionLocator: CodexOpenSessionLocating, CodexOpenS
     discoveryWasReliable = true
     discoveredForRuntimeStartedAt = nil
     lastDiscoveryAt = .distantPast
+    cachedInventory = nil
+    metrics.discoveredPathCount = 0
+  }
+
+  private func trimDiscoveredPaths(at currentTime: Date) {
+    discoveredPaths =
+      discoveredPaths
+      .filter { currentTime.timeIntervalSince($0.value) < Self.discoveredPathLifetime }
+      .sorted { $0.value > $1.value }
+      .prefix(Self.maximumDiscoveredPaths)
+      .reduce(into: [:]) { $0[$1.key] = $1.value }
+    metrics.discoveredPathCount = discoveredPaths.count
   }
 
   private func isSessionJSONL(_ path: String) -> Bool {
@@ -543,6 +689,7 @@ enum CodexLifecycleParseResult: Equatable, Sendable {
   case event(CodexLifecycleEvent)
   case irrelevant
   case malformedLifecycleEvent
+  case oversizedRecord
 }
 
 enum CodexLifecycleParser {
@@ -554,14 +701,23 @@ enum CodexLifecycleParser {
   struct ScanResult {
     let events: [PositionedEvent]
     let malformedOffsets: [Int]
+    let oversizedOffsets: [Int]
   }
 
   private static let lifecycleTypes: Set<String> = [
     "task_started", "turn_started", "task_complete", "turn_complete", "turn_aborted",
   ]
+  static let maximumSupportedLineBytes = 64 * 1_024
 
-  static func parse(_ data: Data) -> CodexLifecycleParseResult {
+  static func parse(
+    _ data: Data,
+    isOverLimit: Bool = false
+  ) -> CodexLifecycleParseResult {
+    guard !isOverLimit, data.count <= maximumSupportedLineBytes else {
+      return .oversizedRecord
+    }
     let result = scan(data)
+    guard result.oversizedOffsets.isEmpty else { return .oversizedRecord }
     guard result.malformedOffsets.isEmpty else { return .malformedLifecycleEvent }
     guard let event = result.events.last?.event else { return .irrelevant }
     return .event(event)
@@ -569,38 +725,50 @@ enum CodexLifecycleParser {
 
   static func events(in data: Data) -> (events: [CodexLifecycleEvent], malformed: Bool) {
     let result = scan(data)
-    return (result.events.map(\.event), !result.malformedOffsets.isEmpty)
+    return (
+      result.events.map(\.event),
+      !result.malformedOffsets.isEmpty || !result.oversizedOffsets.isEmpty
+    )
   }
 
   static func scan(_ data: Data) -> ScanResult {
     var events: [PositionedEvent] = []
     var malformedOffsets: [Int] = []
+    var oversizedOffsets: [Int] = []
     var lineStart = data.startIndex
 
     while lineStart < data.endIndex {
       let lineEnd = data[lineStart...].firstIndex(of: 0x0A) ?? data.endIndex
-      let line = data[lineStart..<lineEnd]
       let offset = data.distance(from: data.startIndex, to: lineStart)
-      switch parseLine(Data(line)) {
-      case .event(let event):
-        events.append(PositionedEvent(offset: offset, event: event))
-      case .malformedLifecycleEvent:
-        malformedOffsets.append(offset)
-      case .irrelevant:
-        break
+      let lineLength = data.distance(from: lineStart, to: lineEnd)
+      if lineLength > maximumSupportedLineBytes {
+        oversizedOffsets.append(offset)
+      } else {
+        let line = data[lineStart..<lineEnd]
+        switch parseLine(Data(line)) {
+        case .event(let event):
+          events.append(PositionedEvent(offset: offset, event: event))
+        case .malformedLifecycleEvent:
+          malformedOffsets.append(offset)
+        case .oversizedRecord:
+          oversizedOffsets.append(offset)
+        case .irrelevant:
+          break
+        }
       }
       guard lineEnd < data.endIndex else { break }
       lineStart = data.index(after: lineEnd)
     }
 
-    return ScanResult(events: events, malformedOffsets: malformedOffsets)
-  }
-
-  static func lastEvent(in data: Data) -> CodexLifecycleParseResult {
-    parse(data)
+    return ScanResult(
+      events: events,
+      malformedOffsets: malformedOffsets,
+      oversizedOffsets: oversizedOffsets
+    )
   }
 
   private static func parseLine(_ data: Data) -> CodexLifecycleParseResult {
+    guard data.count <= maximumSupportedLineBytes else { return .oversizedRecord }
     let trimmed = data.drop(while: { $0 == 0x20 || $0 == 0x09 || $0 == 0x0D })
     guard !trimmed.isEmpty else { return .irrelevant }
 
@@ -662,16 +830,20 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     let currentTurnID: String?
     let currentTurnStartedAt: Date?
     let hasObservedSupportedLifecycle: Bool
+    let hasOverLimitRecord: Bool
   }
 
   private struct FileState {
     let identity: UInt64
     var processedOffset: UInt64
     var pendingLinePrefix: Data
+    var pendingLineIsOverLimit: Bool
     var ownerStartedAt: Date
     var currentTurnID: String?
     var currentTurnStartedAt: Date?
     var hasObservedSupportedLifecycle: Bool
+    var hasOverLimitRecord: Bool
+    var hasPendingBacklog: Bool
     var lastGrowthAt: Date
 
     var isActive: Bool { currentTurnID != nil }
@@ -692,7 +864,7 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
   private static let reverseScanOverlap = 2 * 1_024
   private static let maximumReverseScanBytes = 64 * 1_024 * 1_024
   private static let maximumUpdateBytes = 512 * 1_024
-  private static let maximumLinePrefixBytes = 4 * 1_024
+  private static let maximumLinePrefixBytes = CodexLifecycleParser.maximumSupportedLineBytes
   private static let sessionPrefixSize = 16 * 1_024
   private static let processStartTolerance: TimeInterval = 5
   private static let failedFileLivenessWindow: TimeInterval = 15 * 60
@@ -708,6 +880,11 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
   private var hasObservedSession = false
 
   private(set) var snapshot: CodexActivitySnapshot = .idle
+  private(set) var metrics = CodexMonitorMetrics()
+
+  var hasPendingWork: Bool {
+    states.values.contains { $0.hasPendingBacklog }
+  }
 
   convenience init(
     homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -738,6 +915,7 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     lastKnownRuntime = false
     hasObservedSession = false
     snapshot = .idle
+    metrics.trackedStateCount = 0
   }
 
   func startMonitoring(onChange: @escaping @Sendable () -> Void) {
@@ -750,10 +928,12 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
 
   @discardableResult
   func refresh() -> CodexActivitySnapshot {
+    metrics.refreshes += 1
     let inventory: CodexOpenSessionInventory
     do {
       inventory = try locator.locateOpenSessions()
     } catch {
+      metrics.trackedStateCount = states.count
       let shouldProtect = snapshot.effectiveActiveCount > 0 || lastKnownRuntime
       snapshot = .unavailable(protectConservatively: shouldProtect)
       return snapshot
@@ -766,12 +946,14 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       emptyInventorySince = nil
       hasObservedSession = false
       snapshot = .idle
+      metrics.trackedStateCount = 0
       return snapshot
     }
 
     guard !inventory.files.isEmpty else {
       states.removeAll()
       failureLiveness.removeAll()
+      metrics.trackedStateCount = 0
       guard inventory.isReliable else {
         emptyInventorySince = nil
         snapshot = .unavailable(protectConservatively: true)
@@ -795,7 +977,8 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       emptyInventorySince = emptySince
       let isStillLive =
         currentTime.timeIntervalSince(emptySince) < Self.emptyRuntimeLivenessWindow
-      snapshot = isStillLive
+      snapshot =
+        isStillLive
         ? .unavailable(protectConservatively: true)
         : .idle
       return snapshot
@@ -836,17 +1019,20 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
             failureLiveness.removeValue(forKey: path)
           case .unknown:
             states.removeValue(forKey: path)
-            hasLiveFileFailure = failureIsLive(
-              at: openFile.url,
-              currentTime: currentTime
-            ) || hasLiveFileFailure
+            hasLiveFileFailure =
+              failureIsLive(
+                at: openFile.url,
+                currentTime: currentTime
+              ) || hasLiveFileFailure
           }
         }
       } catch {
-        hasLiveFileFailure = failureIsLive(
-          at: openFile.url,
-          currentTime: currentTime
-        ) || hasLiveFileFailure
+        states[path]?.hasPendingBacklog = false
+        hasLiveFileFailure =
+          failureIsLive(
+            at: openFile.url,
+            currentTime: currentTime
+          ) || hasLiveFileFailure
       }
     }
 
@@ -855,8 +1041,16 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
         && currentTime.timeIntervalSince($0.lastGrowthAt)
           < Self.failedFileLivenessWindow
     }
+    let hasLiveOverLimitRecord = states.values.contains {
+      $0.hasOverLimitRecord
+        && currentTime.timeIntervalSince($0.lastGrowthAt)
+          < Self.failedFileLivenessWindow
+    }
     let hadFailure =
-      !inventory.isReliable || hasLiveFileFailure || hasLiveUnknownState
+      !inventory.isReliable
+      || hasLiveFileFailure
+      || hasLiveUnknownState
+      || hasLiveOverLimitRecord
     let activeCount = states.values.count {
       $0.isActive && !$0.isStalled(now: currentTime)
     }
@@ -869,6 +1063,7 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     } else {
       snapshot = .idle
     }
+    metrics.trackedStateCount = states.count
     return snapshot
   }
 
@@ -938,20 +1133,38 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     let handle = try FileHandle(forReadingFrom: url)
     defer { try? handle.close() }
     let endOffset = try handle.seekToEnd()
-    let committedOffset = try lastCommittedOffset(handle: handle, endOffset: endOffset)
+    let committed = try lastCommittedOffset(handle: handle, endOffset: endOffset)
+    guard committed.foundNewline || endOffset == 0 else {
+      return FileState(
+        identity: identity,
+        processedOffset: endOffset,
+        pendingLinePrefix: Data(),
+        pendingLineIsOverLimit: false,
+        ownerStartedAt: ownerStartedAt,
+        currentTurnID: nil,
+        currentTurnStartedAt: nil,
+        hasObservedSupportedLifecycle: false,
+        hasOverLimitRecord: true,
+        hasPendingBacklog: false,
+        lastGrowthAt: now()
+      )
+    }
     let lifecycle = try bootstrapLifecycleState(
       handle: handle,
-      committedOffset: committedOffset
+      committedOffset: committed.offset
     )
 
     return FileState(
       identity: identity,
-      processedOffset: committedOffset,
+      processedOffset: committed.offset,
       pendingLinePrefix: Data(),
+      pendingLineIsOverLimit: false,
       ownerStartedAt: ownerStartedAt,
       currentTurnID: lifecycle.currentTurnID,
       currentTurnStartedAt: lifecycle.currentTurnStartedAt,
       hasObservedSupportedLifecycle: lifecycle.hasObservedSupportedLifecycle,
+      hasOverLimitRecord: lifecycle.hasOverLimitRecord,
+      hasPendingBacklog: false,
       lastGrowthAt: now()
     )
   }
@@ -981,10 +1194,12 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       let readCount = min(remaining, Self.reverseScanChunkSize)
       let chunk = try handle.read(upToCount: readCount) ?? Data()
       guard !chunk.isEmpty else { break }
+      metrics.lifecycleChunkReads += 1
       try consume(chunk, into: &state)
       state.processedOffset += UInt64(chunk.count)
       remaining -= chunk.count
     }
+    state.hasPendingBacklog = endOffset > state.processedOffset
   }
 
   private func consume(_ data: Data, into state: inout FileState) throws {
@@ -1006,19 +1221,32 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     to state: inout FileState
   ) {
     let remainingCapacity = Self.maximumLinePrefixBytes - state.pendingLinePrefix.count
+    if data.count > remainingCapacity {
+      state.pendingLineIsOverLimit = true
+    }
     guard remainingCapacity > 0 else { return }
     state.pendingLinePrefix.append(contentsOf: data.prefix(remainingCapacity))
   }
 
   private func finishPendingLine(in state: inout FileState) throws {
-    defer { state.pendingLinePrefix.removeAll(keepingCapacity: true) }
-    switch CodexLifecycleParser.parse(state.pendingLinePrefix) {
+    let isOverLimit = state.pendingLineIsOverLimit
+    defer {
+      state.pendingLinePrefix.removeAll(keepingCapacity: true)
+      state.pendingLineIsOverLimit = false
+    }
+    switch CodexLifecycleParser.parse(
+      state.pendingLinePrefix,
+      isOverLimit: isOverLimit
+    ) {
     case .event(let event):
+      state.hasOverLimitRecord = false
       apply(event, to: &state)
     case .irrelevant:
       break
     case .malformedLifecycleEvent:
       throw CocoaError(.fileReadCorruptFile)
+    case .oversizedRecord:
+      state.hasOverLimitRecord = true
     }
   }
 
@@ -1059,7 +1287,8 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       return BootstrapLifecycleState(
         currentTurnID: nil,
         currentTurnStartedAt: nil,
-        hasObservedSupportedLifecycle: false
+        hasObservedSupportedLifecycle: false,
+        hasOverLimitRecord: false
       )
     }
     var cursor = committedOffset
@@ -1081,6 +1310,14 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
       chunk.append(suffix)
 
       let scan = CodexLifecycleParser.scan(chunk)
+      if scan.oversizedOffsets.contains(where: { $0 < newDataCount }) {
+        return BootstrapLifecycleState(
+          currentTurnID: nil,
+          currentTurnStartedAt: nil,
+          hasObservedSupportedLifecycle: observedLifecycle,
+          hasOverLimitRecord: true
+        )
+      }
       if scan.malformedOffsets.contains(where: { $0 < newDataCount }) {
         throw CocoaError(.fileReadCorruptFile)
       }
@@ -1095,7 +1332,8 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
             return BootstrapLifecycleState(
               currentTurnID: nil,
               currentTurnStartedAt: nil,
-              hasObservedSupportedLifecycle: true
+              hasObservedSupportedLifecycle: true,
+              hasOverLimitRecord: false
             )
           }
           completedTurnIDs.insert(turnID)
@@ -1107,7 +1345,8 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
           return BootstrapLifecycleState(
             currentTurnID: isCompleted ? nil : turnID,
             currentTurnStartedAt: isCompleted ? nil : event.startedAt,
-            hasObservedSupportedLifecycle: true
+            hasObservedSupportedLifecycle: true,
+            hasOverLimitRecord: false
           )
         }
       }
@@ -1121,27 +1360,43 @@ final class CodexSessionActivityMonitor: CodexActivityProviding {
     return BootstrapLifecycleState(
       currentTurnID: nil,
       currentTurnStartedAt: nil,
-      hasObservedSupportedLifecycle: reachedBeginning && observedLifecycle
+      hasObservedSupportedLifecycle: reachedBeginning && observedLifecycle,
+      hasOverLimitRecord: false
     )
+  }
+
+  private struct CommittedOffset {
+    let offset: UInt64
+    let foundNewline: Bool
   }
 
   private func lastCommittedOffset(
     handle: FileHandle,
     endOffset: UInt64
-  ) throws -> UInt64 {
-    guard endOffset > 0 else { return 0 }
+  ) throws -> CommittedOffset {
+    guard endOffset > 0 else {
+      return CommittedOffset(offset: 0, foundNewline: false)
+    }
     var cursor = endOffset
-    while cursor > 0 {
-      let count = min(UInt64(Self.reverseScanChunkSize), cursor)
+    var scannedBytes: UInt64 = 0
+    while cursor > 0, scannedBytes < Self.maximumReverseScanBytes {
+      let count = min(
+        UInt64(Self.reverseScanChunkSize),
+        min(cursor, UInt64(Self.maximumReverseScanBytes) - scannedBytes)
+      )
       let start = cursor - count
       try handle.seek(toOffset: start)
       let data = try handle.read(upToCount: Int(count)) ?? Data()
       if let newline = data.lastIndex(of: 0x0A) {
-        return start + UInt64(data.distance(from: data.startIndex, to: newline)) + 1
+        return CommittedOffset(
+          offset: start + UInt64(data.distance(from: data.startIndex, to: newline)) + 1,
+          foundNewline: true
+        )
       }
       cursor = start
+      scannedBytes += UInt64(data.count)
     }
-    return 0
+    return CommittedOffset(offset: endOffset, foundNewline: false)
   }
 
   private func fileIdentity(at url: URL) throws -> UInt64 {

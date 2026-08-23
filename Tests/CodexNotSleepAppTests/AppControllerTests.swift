@@ -1,6 +1,6 @@
+import CodexNotSleepCore
 import Foundation
 import Testing
-import CodexNotSleepCore
 
 @testable import CodexNotSleepApp
 
@@ -26,7 +26,7 @@ struct AppControllerTests {
     controller.refreshCodexActivity()
 
     #expect(controller.isProtectionEnabled)
-    #expect(controller.phase == .protected(reason: "running_agent"))
+    #expect(controller.phase == .protected(reason: "active_codex_task"))
     #expect(backend.acquireCount == 1)
     #expect(backend.isHeld)
 
@@ -63,9 +63,77 @@ struct AppControllerTests {
     activity.snapshot = .active(turnCount: 1)
     controller.refreshCodexActivity()
 
-    #expect(controller.phase == .protected(reason: "running_agent"))
+    #expect(controller.phase == .protected(reason: "active_codex_task"))
     #expect(backend.acquireCount == 1)
     #expect(backend.releaseCount == 0)
+  }
+
+  @Test
+  func graceDeadlineReleasesAtDeadlineWithoutReconciliation() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+
+    let backend = TestSleepProtectionBackend()
+    let activity = TestCodexActivityProvider(snapshot: .active(turnCount: 1))
+    let scheduler = TestGraceDeadlineScheduler()
+    var currentTime = Date(timeIntervalSince1970: 20_000)
+    let controller = makeController(
+      defaults: defaults,
+      backend: backend,
+      activity: activity,
+      graceSeconds: 15,
+      graceDeadlineScheduler: scheduler,
+      now: { currentTime }
+    )
+
+    controller.refreshCodexActivity()
+    activity.snapshot = .idle
+    controller.refreshCodexActivity()
+
+    let deadline = try #require(scheduler.scheduledDeadline)
+    #expect(deadline == currentTime.addingTimeInterval(15))
+    currentTime = deadline.addingTimeInterval(-0.1)
+    scheduler.fire()
+    #expect(controller.phase != .idle)
+    #expect(backend.releaseCount == 0)
+
+    currentTime = deadline
+    scheduler.fire()
+    #expect(controller.phase == .idle)
+    #expect(backend.releaseCount == 1)
+  }
+
+  @Test
+  func graceDeadlineIsCancelledByNewWorkAndDisabling() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+
+    let scheduler = TestGraceDeadlineScheduler()
+    let activity = TestCodexActivityProvider(snapshot: .active(turnCount: 1))
+    let controller = makeController(
+      defaults: defaults,
+      backend: TestSleepProtectionBackend(),
+      activity: activity,
+      graceSeconds: 15,
+      graceDeadlineScheduler: scheduler
+    )
+
+    controller.refreshCodexActivity()
+    activity.snapshot = .idle
+    controller.refreshCodexActivity()
+    #expect(scheduler.scheduledDeadline != nil)
+
+    activity.snapshot = .active(turnCount: 1)
+    controller.refreshCodexActivity()
+    #expect(scheduler.cancelCount > 0)
+    #expect(scheduler.scheduledDeadline == nil)
+
+    activity.snapshot = .idle
+    controller.refreshCodexActivity()
+    controller.setProtectionEnabled(false)
+    #expect(scheduler.scheduledDeadline == nil)
   }
 
   @Test
@@ -118,7 +186,7 @@ struct AppControllerTests {
 
     controller.refreshCodexActivity()
 
-    #expect(controller.phase == .protected(reason: "running_agent"))
+    #expect(controller.phase == .protected(reason: "active_codex_task"))
     #expect(backend.isHeld)
     #expect(controller.visibleError == nil)
   }
@@ -244,16 +312,19 @@ struct AppControllerTests {
     backend: TestSleepProtectionBackend,
     battery: TestBatteryStatusProvider = TestBatteryStatusProvider(status: nil),
     activity: TestCodexActivityProvider,
-    graceSeconds: TimeInterval
+    graceSeconds: TimeInterval,
+    graceDeadlineScheduler: any GraceDeadlineScheduling = TestGraceDeadlineScheduler(),
+    now: @escaping () -> Date = Date.init
   ) -> AppController {
     AppController(
       defaults: defaults,
-      legacyIntegrations: LegacyIntegrationMigrator(homeDirectory: fixtureHome()),
       backend: backend,
       batteryStatusProvider: battery,
       codexActivityProvider: activity,
       protectionGraceSeconds: graceSeconds,
-      startsAutomatically: false
+      startsAutomatically: false,
+      graceDeadlineScheduler: graceDeadlineScheduler,
+      now: now
     )
   }
 
@@ -336,6 +407,33 @@ private final class TestBatteryStatusProvider: BatteryStatusProviding, @unchecke
 
   func currentStatus() -> BatteryStatus? {
     status
+  }
+}
+
+@MainActor
+private final class TestGraceDeadlineScheduler: GraceDeadlineScheduling {
+  private(set) var scheduledDeadline: Date?
+  private var scheduledHandler: (@MainActor @Sendable () -> Void)?
+  private(set) var scheduleCount = 0
+  private(set) var cancelCount = 0
+
+  func schedule(
+    at deadline: Date,
+    handler: @escaping @MainActor @Sendable () -> Void
+  ) {
+    scheduledDeadline = deadline
+    scheduledHandler = handler
+    scheduleCount += 1
+  }
+
+  func cancel() {
+    scheduledDeadline = nil
+    scheduledHandler = nil
+    cancelCount += 1
+  }
+
+  func fire() {
+    scheduledHandler?()
   }
 }
 

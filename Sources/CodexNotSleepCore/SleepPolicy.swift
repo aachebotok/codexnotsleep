@@ -30,7 +30,7 @@ public struct SleepPolicyMachine: Sendable {
     now: Date = Date()
   ) -> ProtectionPhase {
     if config.autoMode && activeCount > 0 {
-      phase = .protected(reason: "running_agent")
+      phase = .protected(reason: "active_codex_task")
       return phase
     }
 

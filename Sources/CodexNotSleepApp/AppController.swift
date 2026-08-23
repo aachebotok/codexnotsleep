@@ -1,42 +1,38 @@
 import AppKit
-import Foundation
 import CodexNotSleepCore
+import Foundation
 
 @MainActor
 final class AppController: NSObject {
-  private static let legacyMigrationVersion = 2
-  private static let legacyMigrationVersionKey = "legacyHookMigrationVersion"
   private static let backendRenewInterval: TimeInterval = 30
   static let lowBatterySleepThresholdPercent = 10.0
   static let menuIconName = "pointer.arrow.ipad.rays"
 
   private(set) var isProtectionEnabled: Bool
   private(set) var isPreparingProtection = false
+  private(set) var isPreparingClosedLid = false
   private(set) var isResolvingIssue = false
+  private(set) var isClosedLidEnabled: Bool
   private(set) var phase: ProtectionPhase = .idle
   private(set) var menuIssue: MenuIssue?
 
-  private let defaults: UserDefaults
   private let protectionStore: ProtectionPreferenceStore
-  private let legacyIntegrations: LegacyIntegrationMigrator
   private let backend: any SleepProtectionBackend
+  private let closedLidProtection: (any ClosedLidProtectionManaging)?
   private let backendWorker: SleepProtectionWorker
   private let batteryStatusProvider: any BatteryStatusProviding
   private let codexActivityProvider: any CodexActivityProviding
   private let activityWorker: CodexActivityWorker
   private let launchAtLoginController: any LaunchAtLoginControlling
   private let lidBrightnessController: any LidBrightnessControlling
+  private let graceDeadlineScheduler: any GraceDeadlineScheduling
   private let protectionGraceSeconds: TimeInterval
+  private let now: () -> Date
   private let usesBackgroundSystemWork: Bool
   private let batteryQueue = DispatchQueue(
     label: "app.codexnotsleep.battery-status",
     qos: .utility
   )
-  private let maintenanceQueue = DispatchQueue(
-    label: "app.codexnotsleep.maintenance",
-    qos: .utility
-  )
-
   private var codexActivitySnapshot: CodexActivitySnapshot
   private var policy: SleepPolicyMachine
   private var lastBackendRenewAt = Date.distantPast
@@ -55,12 +51,14 @@ final class AppController: NSObject {
   convenience init(startsAutomatically: Bool) {
     let defaults = UserDefaults.standard
     LegacyPreferencesMigrator(defaults: defaults).migrate()
+    let protectionStore = ProtectionPreferenceStore(defaults: defaults)
+    let closedLidEnabled = protectionStore.loadClosedLidEnabled()
     self.init(
       defaults: defaults,
-      legacyIntegrations: LegacyIntegrationMigrator(),
       backend: CombinedSleepProtectionBackend(
         idleSleep: IdleSleepAssertionBackend(),
-        closedLid: PMSetPowerProtectBackend()
+        closedLid: PMSetPowerProtectBackend(closedLidEnabled: closedLidEnabled),
+        closedLidEnabled: closedLidEnabled
       ),
       batteryStatusProvider: IOKitBatteryStatusProvider(),
       codexActivityProvider: CodexSessionActivityMonitor(),
@@ -72,7 +70,6 @@ final class AppController: NSObject {
 
   init(
     defaults: UserDefaults,
-    legacyIntegrations: LegacyIntegrationMigrator,
     backend: any SleepProtectionBackend,
     batteryStatusProvider: any BatteryStatusProviding = IOKitBatteryStatusProvider(),
     codexActivityProvider: any CodexActivityProviding = CodexSessionActivityMonitor(),
@@ -80,7 +77,9 @@ final class AppController: NSObject {
     protectionGraceSeconds: TimeInterval = 15,
     startsAutomatically: Bool,
     lidBrightnessController: any LidBrightnessControlling = NoOpLidBrightnessController(),
-    performsSystemWorkOffMainActor: Bool? = nil
+    performsSystemWorkOffMainActor: Bool? = nil,
+    graceDeadlineScheduler: any GraceDeadlineScheduling = RunLoopGraceDeadlineScheduler(),
+    now: @escaping () -> Date = Date.init
   ) {
     let protectionStore = ProtectionPreferenceStore(defaults: defaults)
     let storedPreference = protectionStore.load()
@@ -99,20 +98,22 @@ final class AppController: NSObject {
       protectionStore.save(isProtectionEnabled)
     }
 
-    self.defaults = defaults
     self.protectionStore = protectionStore
-    self.legacyIntegrations = legacyIntegrations
     self.backend = backend
+    closedLidProtection = backend as? any ClosedLidProtectionManaging
     backendWorker = SleepProtectionWorker(backend: backend)
     self.batteryStatusProvider = batteryStatusProvider
     self.codexActivityProvider = codexActivityProvider
     activityWorker = CodexActivityWorker(provider: codexActivityProvider)
     self.launchAtLoginController = launchAtLoginController
     self.lidBrightnessController = lidBrightnessController
+    self.graceDeadlineScheduler = graceDeadlineScheduler
     self.protectionGraceSeconds = protectionGraceSeconds
+    self.now = now
     usesBackgroundSystemWork = performsSystemWorkOffMainActor ?? startsAutomatically
     codexActivitySnapshot = codexActivityProvider.snapshot
     self.isProtectionEnabled = isProtectionEnabled
+    isClosedLidEnabled = (backend as? any ClosedLidProtectionManaging)?.isClosedLidEnabled ?? false
     backendHeld = backend.isHeld
     policy = SleepPolicyMachine(
       config: SleepPolicyConfig(autoMode: true, graceSeconds: protectionGraceSeconds)
@@ -129,22 +130,10 @@ final class AppController: NSObject {
 
   var visibleError: String? { menuIssue?.title }
 
-  var statusTitle: String {
-    if let menuIssue { return menuIssue.title }
-    if isPreparingProtection { return "Setting up sleep protection" }
-    if !isProtectionEnabled { return "Sleep protection is off" }
-
-    switch phase {
-    case .idle:
-      return "Waiting"
-    case .protected:
-      return "Preventing sleep"
-    case .grace:
-      return "Finishing up"
-    }
+  var closedLidMenuTitle: String? {
+    guard closedLidProtection != nil else { return nil }
+    return isClosedLidEnabled ? "Don't Use with Lid Closed" : "Use with Lid Closed…"
   }
-
-  var menuIcon: String { Self.menuIconName }
 
   func start() {
     guard !started else { return }
@@ -152,6 +141,12 @@ final class AppController: NSObject {
 
     if let launchAtLoginError = launchAtLoginController.enableByDefault() {
       NSLog("Codex Not Sleep launch-at-login setup failed: %@", launchAtLoginError)
+    }
+
+    batteryStatusProvider.startMonitoring { [weak self] in
+      Task { @MainActor in
+        self?.requestEvaluation()
+      }
     }
 
     NotificationCenter.default.addObserver(
@@ -163,7 +158,6 @@ final class AppController: NSObject {
 
     if usesBackgroundSystemWork {
       startBackgroundRecovery()
-      startLegacyMigrationOffMainActor()
     } else {
       do {
         try backend.recover()
@@ -171,7 +165,6 @@ final class AppController: NSObject {
       } catch {
         finishRecovery(.failure(error))
       }
-      migrateLegacyIntegrations()
     }
   }
 
@@ -188,16 +181,6 @@ final class AppController: NSObject {
     }
     codexActivitySnapshot = codexActivityProvider.refresh()
     requestEvaluation()
-  }
-
-  /// Compatibility seam for deterministic tests and manual recovery checks.
-  /// There is no recurring timer calling this method.
-  func tick() {
-    if usesBackgroundSystemWork {
-      activityWorker.requestRefresh()
-    } else {
-      refreshCodexActivity()
-    }
   }
 
   func setProtectionEnabled(_ isEnabled: Bool) {
@@ -240,20 +223,31 @@ final class AppController: NSObject {
     guard let menuIssue, !isResolvingIssue else { return }
     switch menuIssue {
     case .permissionRequired:
-      setProtectionEnabled(true)
+      enableClosedLidProtection()
     case .sleepRestoreRequired:
       restoreSleepFromMenu()
+    }
+  }
+
+  func toggleClosedLidProtection() {
+    guard closedLidProtection != nil, !isPreparingClosedLid else { return }
+    if isClosedLidEnabled {
+      setClosedLidMode(false)
+    } else {
+      enableClosedLidProtection()
     }
   }
 
   /// Requests a clean quit. A background release must complete before the app
   /// terminates; otherwise a failed restore remains visible and recoverable.
   func quit() {
+    graceDeadlineScheduler.cancel()
     guard started else {
       NSApplication.shared.terminate(nil)
       return
     }
 
+    batteryStatusProvider.stopMonitoring()
     activityWorker.stop()
     activityWorker.reset()
     lidBrightnessController.reset()
@@ -290,31 +284,6 @@ final class AppController: NSObject {
     }
   }
 
-  func migrateLegacyIntegrations() {
-    guard
-      defaults.integer(forKey: Self.legacyMigrationVersionKey)
-        < Self.legacyMigrationVersion
-    else { return }
-
-    var failures: [String] = []
-    for integration in IntegrationKind.allCases where legacyIntegrations.isInstalled(integration) {
-      do {
-        try legacyIntegrations.remove(integration)
-      } catch {
-        failures.append(integration == .codex ? "Codex" : "Claude")
-      }
-    }
-
-    if failures.isEmpty {
-      defaults.set(Self.legacyMigrationVersion, forKey: Self.legacyMigrationVersionKey)
-    } else {
-      NSLog(
-        "Codex Not Sleep could not remove legacy integrations: %@",
-        failures.joined(separator: ", ")
-      )
-    }
-  }
-
   private func startBackgroundRecovery() {
     backendWorker.recover { [weak self] result in
       self?.finishRecovery(result)
@@ -330,6 +299,7 @@ final class AppController: NSObject {
       if isProtectionEnabled { startActivityMonitoring() }
       requestEvaluation()
     case .failure(let error):
+      graceDeadlineScheduler.cancel()
       recoveryPending = true
       phase = .idle
       menuIssue = .sleepRestoreRequired
@@ -370,6 +340,7 @@ final class AppController: NSObject {
     }
 
     stopActivityMonitoring()
+    graceDeadlineScheduler.cancel()
     lidBrightnessController.setCodexWorking(false)
     if backendOperationInFlight {
       // A queued acquire/renew may finish after the user disables the toggle.
@@ -418,6 +389,7 @@ final class AppController: NSObject {
     let lowBattery = batteryStatus?.isAtOrBelow(Self.lowBatterySleepThresholdPercent) ?? false
     if !isProtectionEnabled || lowBattery {
       lidBrightnessController.setCodexWorking(false)
+      graceDeadlineScheduler.cancel()
       policy = SleepPolicyMachine(
         config: SleepPolicyConfig(autoMode: true, graceSeconds: protectionGraceSeconds)
       )
@@ -434,16 +406,17 @@ final class AppController: NSObject {
       isCodexWorking = false
     }
     lidBrightnessController.setCodexWorking(isCodexWorking)
-    phase = policy.evaluate(activeCount: activeCount)
+    phase = policy.evaluate(activeCount: activeCount, now: now())
+    synchronizeGraceDeadline()
 
     guard !backendOperationInFlight else {
       evaluationRequestedAgain = true
       return
     }
     if policy.shouldProtect {
-      let now = Date.now
+      let currentTime = now()
       if isBackendHeld {
-        guard now.timeIntervalSince(lastBackendRenewAt) >= Self.backendRenewInterval else {
+        guard currentTime.timeIntervalSince(lastBackendRenewAt) >= Self.backendRenewInterval else {
           return
         }
         requestRenew()
@@ -452,6 +425,72 @@ final class AppController: NSObject {
       }
     } else if isBackendHeld {
       requestRelease()
+    }
+  }
+
+  private func synchronizeGraceDeadline() {
+    guard case .grace(let deadline) = policy.phase else {
+      graceDeadlineScheduler.cancel()
+      return
+    }
+
+    graceDeadlineScheduler.schedule(at: deadline) { [weak self] in
+      guard let self, self.isProtectionEnabled else { return }
+      self.requestEvaluation()
+    }
+  }
+
+  private func enableClosedLidProtection() {
+    guard let closedLidProtection, !isPreparingClosedLid else { return }
+    isPreparingClosedLid = true
+    menuIssue = nil
+    let finish: @MainActor @Sendable (Result<Void, Error>) -> Void = { [weak self] result in
+      guard let self else { return }
+      switch result {
+      case .success:
+        setClosedLidMode(true)
+      case .failure(let error):
+        isPreparingClosedLid = false
+        menuIssue = .permissionRequired
+        logHiddenError("configure closed-lid protection", error: error)
+      }
+    }
+
+    if usesBackgroundSystemWork {
+      backendWorker.prepareClosedLid(completion: finish)
+    } else {
+      do {
+        try closedLidProtection.prepareClosedLid()
+        finish(.success(()))
+      } catch {
+        finish(.failure(error))
+      }
+    }
+  }
+
+  private func setClosedLidMode(_ enabled: Bool) {
+    guard closedLidProtection != nil else { return }
+    let finish: @MainActor @Sendable (Result<Void, Error>) -> Void = { [weak self] result in
+      guard let self else { return }
+      isPreparingClosedLid = false
+      switch result {
+      case .success:
+        isClosedLidEnabled = enabled
+        protectionStore.saveClosedLidEnabled(enabled)
+        menuIssue = nil
+        lastBackendRenewAt = .distantPast
+        requestEvaluation()
+      case .failure(let error):
+        menuIssue = .sleepRestoreRequired
+        logHiddenError("change closed-lid protection", error: error)
+      }
+    }
+
+    if usesBackgroundSystemWork {
+      backendWorker.setClosedLidEnabled(enabled, completion: finish)
+    } else {
+      closedLidProtection?.setClosedLidEnabled(enabled)
+      finish(.success(()))
     }
   }
 
@@ -575,7 +614,7 @@ final class AppController: NSObject {
         menuIssue = activationIssue
       } else {
         backendHeld = true
-        lastBackendRenewAt = Date.now
+        lastBackendRenewAt = now()
         menuIssue = nil
       }
     case .failure(let error):
@@ -583,7 +622,8 @@ final class AppController: NSObject {
         menuIssue = .sleepRestoreRequired
         logHiddenError("restore sleep", error: error)
       } else {
-        let activationIssue: MenuIssue? = (error as? PowerProtectError) == .setupRequired
+        let activationIssue: MenuIssue? =
+          (error as? PowerProtectError) == .setupRequired
           ? .permissionRequired
           : nil
         menuIssue = activationIssue
@@ -642,6 +682,7 @@ final class AppController: NSObject {
     isResolvingIssue = false
     switch result {
     case .success:
+      graceDeadlineScheduler.cancel()
       recoveryPending = false
       backendHeld = false
       lastBackendRenewAt = .distantPast
@@ -652,40 +693,10 @@ final class AppController: NSObject {
         requestEvaluation()
       }
     case .failure(let error):
+      graceDeadlineScheduler.cancel()
       pendingActivationIssue = nil
       menuIssue = .sleepRestoreRequired
       logHiddenError("restore sleep from menu", error: error)
-    }
-  }
-
-  private func startLegacyMigrationOffMainActor() {
-    guard defaults.integer(forKey: Self.legacyMigrationVersionKey) < Self.legacyMigrationVersion else {
-      return
-    }
-    let migrator = legacyIntegrations
-    maintenanceQueue.async {
-      var failures: [String] = []
-      for integration in IntegrationKind.allCases where migrator.isInstalled(integration) {
-        do {
-          try migrator.remove(integration)
-        } catch {
-          failures.append(integration == .codex ? "Codex" : "Claude")
-        }
-      }
-      DispatchQueue.main.async { [weak self] in
-        guard let self else { return }
-        if failures.isEmpty {
-          self.defaults.set(
-            Self.legacyMigrationVersion,
-            forKey: Self.legacyMigrationVersionKey
-          )
-        } else {
-          NSLog(
-            "Codex Not Sleep could not remove legacy integrations: %@",
-            failures.joined(separator: ", ")
-          )
-        }
-      }
     }
   }
 
@@ -701,6 +712,8 @@ final class AppController: NSObject {
   private func shutdown() {
     guard started else { return }
     started = false
+    graceDeadlineScheduler.cancel()
+    batteryStatusProvider.stopMonitoring()
     activityWorker.stop()
     activityWorker.reset()
     lidBrightnessController.reset()

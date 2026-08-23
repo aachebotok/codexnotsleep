@@ -8,7 +8,7 @@ import Testing
 
   @Test func lastTaskStartsFifteenSecondGraceThenReleases() {
     var policy = SleepPolicyMachine(config: .init(autoMode: true, graceSeconds: 15))
-    #expect(policy.evaluate(activeCount: 1, now: base) == .protected(reason: "running_agent"))
+    #expect(policy.evaluate(activeCount: 1, now: base) == .protected(reason: "active_codex_task"))
     #expect(
       policy.evaluate(activeCount: 0, now: base) == .grace(until: base.addingTimeInterval(15)))
     #expect(policy.shouldProtect)
@@ -19,10 +19,10 @@ import Testing
     #expect(!policy.shouldProtect)
   }
 
-  @Test func runningAgentCountProtectsWithoutLegacyActivityRecords() {
+  @Test func activeCodexTaskProtectsWithoutTranscriptRecords() {
     var policy = SleepPolicyMachine(config: .init(autoMode: true, graceSeconds: 15))
 
-    #expect(policy.evaluate(activeCount: 1, now: base) == .protected(reason: "running_agent"))
+    #expect(policy.evaluate(activeCount: 1, now: base) == .protected(reason: "active_codex_task"))
     #expect(policy.shouldProtect)
     #expect(
       policy.evaluate(activeCount: 0, now: base) == .grace(until: base.addingTimeInterval(15)))

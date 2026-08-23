@@ -2,12 +2,14 @@ import Foundation
 
 /// Serializes Codex file/process inspection away from the main actor.
 ///
-/// FSEvents is the normal wake-up path. The 30-second reconciliation is only
-/// a recovery path for a dropped event, a runtime that started before the app,
-/// sleep/wake, or a recreated session directory; it is not the activity loop.
+/// FSEvents is the normal wake-up path. Reconciliation is a recovery path for
+/// dropped events, a runtime that started before the app, sleep/wake, or a
+/// recreated session directory; it is not the activity loop.
 // All mutable state and provider access are serialized on `queue`.
 final class CodexActivityWorker: @unchecked Sendable {
-  static let reconciliationInterval: TimeInterval = 30
+  static let activeReconciliationInterval: TimeInterval = 30
+  static let idleReconciliationInterval: TimeInterval = 5 * 60
+  static let fallbackReconciliationInterval: TimeInterval = 30
 
   private let provider: any CodexActivityProviding
   private let queue = DispatchQueue(
@@ -17,8 +19,8 @@ final class CodexActivityWorker: @unchecked Sendable {
   private var reconciliationTimer: DispatchSourceTimer?
   private var isStarted = false
   private var refreshScheduled = false
-  private var snapshotHandler:
-    (@MainActor @Sendable (CodexActivitySnapshot) -> Void)?
+  private var snapshotHandler: (@MainActor @Sendable (CodexActivitySnapshot) -> Void)?
+  private(set) var lastScheduledReconciliationInterval: TimeInterval?
 
   init(provider: any CodexActivityProviding) {
     self.provider = provider
@@ -41,11 +43,6 @@ final class CodexActivityWorker: @unchecked Sendable {
       }
 
       let timer = DispatchSource.makeTimerSource(queue: self.queue)
-      timer.schedule(
-        deadline: .now() + Self.reconciliationInterval,
-        repeating: Self.reconciliationInterval,
-        leeway: .seconds(5)
-      )
       timer.setEventHandler { [weak self] in
         self?.scheduleRefresh()
       }
@@ -78,6 +75,7 @@ final class CodexActivityWorker: @unchecked Sendable {
       self.provider.stopMonitoring()
       self.refreshScheduled = false
       self.snapshotHandler = nil
+      self.lastScheduledReconciliationInterval = nil
     }
   }
 
@@ -88,10 +86,33 @@ final class CodexActivityWorker: @unchecked Sendable {
       guard let self, self.isStarted else { return }
       self.refreshScheduled = false
       let snapshot = self.provider.refresh()
+      if self.provider.hasPendingWork {
+        self.scheduleRefresh()
+      }
+      self.scheduleReconciliation(for: snapshot)
       guard let snapshotHandler = self.snapshotHandler else { return }
       DispatchQueue.main.async {
         snapshotHandler(snapshot)
       }
     }
+  }
+
+  private func scheduleReconciliation(for snapshot: CodexActivitySnapshot) {
+    guard let timer = reconciliationTimer, isStarted else { return }
+    let interval: TimeInterval
+    switch snapshot {
+    case .idle:
+      interval = Self.idleReconciliationInterval
+    case .active:
+      interval = Self.activeReconciliationInterval
+    case .unavailable:
+      interval = Self.fallbackReconciliationInterval
+    }
+    lastScheduledReconciliationInterval = interval
+    timer.schedule(
+      deadline: .now() + interval,
+      repeating: .never,
+      leeway: .seconds(5)
+    )
   }
 }
