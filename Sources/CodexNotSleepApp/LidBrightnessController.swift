@@ -44,6 +44,196 @@ struct LidSensorConnectionStateMachine: Equatable, Sendable {
   }
 }
 
+struct LidHIDInputValue: Equatable, Sendable {
+  let usagePage: UInt32
+  let usage: UInt32
+  let integerValue: Int64
+}
+
+typealias LidHIDInputHandler =
+  @MainActor @Sendable (LidHIDInputValue) -> Void
+typealias LidHIDEventHandler = @MainActor @Sendable () -> Void
+
+@MainActor
+protocol LidHIDManagerAdapter: AnyObject {
+  func setDeviceMatching(_ matching: [String: Any])
+  func registerInputValueHandler(_ handler: @escaping LidHIDInputHandler)
+  func registerDeviceMatchingHandler(_ handler: @escaping LidHIDEventHandler)
+  func registerDeviceRemovalHandler(_ handler: @escaping LidHIDEventHandler)
+  func setDispatchQueue(_ queue: DispatchQueue)
+  func setCancellationHandler(_ handler: @escaping LidHIDEventHandler)
+  func open() -> IOReturn
+  func activate() -> Bool
+  func copyDevices() -> CFSet?
+  func cancel()
+  func close()
+}
+
+@MainActor
+protocol LidHIDManagerFactory: AnyObject {
+  func makeManager() -> (any LidHIDManagerAdapter)?
+}
+
+@MainActor
+final class SystemLidHIDManagerFactory: LidHIDManagerFactory {
+  func makeManager() -> (any LidHIDManagerAdapter)? {
+    SystemLidHIDManagerAdapter()
+  }
+}
+
+@MainActor
+final class SystemLidHIDManagerAdapter: LidHIDManagerAdapter {
+  private let manager: IOHIDManager
+  private var dispatchQueue: DispatchQueue?
+  private var inputValueHandler: LidHIDInputHandler?
+  private var deviceMatchingHandler: LidHIDEventHandler?
+  private var deviceRemovalHandler: LidHIDEventHandler?
+  private var cancellationHandler: LidHIDEventHandler?
+  private var isOpen = false
+  private var isActivated = false
+  private var cancellationRequested = false
+  private var didClose = false
+
+  init() {
+    manager = IOHIDManagerCreate(
+      kCFAllocatorDefault,
+      IOOptionBits(kIOHIDOptionsTypeNone)
+    )
+  }
+
+  func setDeviceMatching(_ matching: [String: Any]) {
+    IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
+  }
+
+  func registerInputValueHandler(_ handler: @escaping LidHIDInputHandler) {
+    inputValueHandler = handler
+    IOHIDManagerRegisterInputValueCallback(
+      manager,
+      Self.inputValueCallback,
+      Unmanaged.passUnretained(self).toOpaque()
+    )
+  }
+
+  func registerDeviceMatchingHandler(_ handler: @escaping LidHIDEventHandler) {
+    deviceMatchingHandler = handler
+    IOHIDManagerRegisterDeviceMatchingCallback(
+      manager,
+      Self.deviceMatchingCallback,
+      Unmanaged.passUnretained(self).toOpaque()
+    )
+  }
+
+  func registerDeviceRemovalHandler(_ handler: @escaping LidHIDEventHandler) {
+    deviceRemovalHandler = handler
+    IOHIDManagerRegisterDeviceRemovalCallback(
+      manager,
+      Self.deviceRemovalCallback,
+      Unmanaged.passUnretained(self).toOpaque()
+    )
+  }
+
+  func setDispatchQueue(_ queue: DispatchQueue) {
+    dispatchQueue = queue
+    IOHIDManagerSetDispatchQueue(manager, queue)
+  }
+
+  func setCancellationHandler(_ handler: @escaping LidHIDEventHandler) {
+    cancellationHandler = handler
+    IOHIDManagerSetCancelHandler(manager) { [weak self] in
+      Task { @MainActor [weak self] in
+        self?.cancellationHandler?()
+      }
+    }
+  }
+
+  func open() -> IOReturn {
+    guard !didClose, !isOpen else { return kIOReturnSuccess }
+    let result = IOHIDManagerOpen(
+      manager,
+      IOOptionBits(kIOHIDOptionsTypeNone)
+    )
+    if result == kIOReturnSuccess {
+      isOpen = true
+    }
+    return result
+  }
+
+  func activate() -> Bool {
+    guard isOpen, !isActivated, !cancellationRequested, !didClose else {
+      return false
+    }
+    IOHIDManagerActivate(manager)
+    isActivated = true
+    return true
+  }
+
+  func copyDevices() -> CFSet? {
+    IOHIDManagerCopyDevices(manager)
+  }
+
+  func cancel() {
+    guard isActivated, !cancellationRequested, !didClose else { return }
+    cancellationRequested = true
+    IOHIDManagerCancel(manager)
+  }
+
+  func close() {
+    guard !didClose else { return }
+    didClose = true
+    if isOpen {
+      _ = IOHIDManagerClose(
+        manager,
+        IOOptionBits(kIOHIDOptionsTypeNone)
+      )
+      isOpen = false
+    }
+    inputValueHandler = nil
+    deviceMatchingHandler = nil
+    deviceRemovalHandler = nil
+    cancellationHandler = nil
+    dispatchQueue = nil
+  }
+
+  private static let inputValueCallback: IOHIDValueCallback = {
+    context, _, _, value in
+    guard let context else { return }
+    let adapter = Unmanaged<SystemLidHIDManagerAdapter>
+      .fromOpaque(context)
+      .takeUnretainedValue()
+    let element = IOHIDValueGetElement(value)
+    let input = LidHIDInputValue(
+      usagePage: IOHIDElementGetUsagePage(element),
+      usage: IOHIDElementGetUsage(element),
+      integerValue: Int64(IOHIDValueGetIntegerValue(value))
+    )
+    Task { @MainActor [weak adapter] in
+      adapter?.inputValueHandler?(input)
+    }
+  }
+
+  private static let deviceMatchingCallback: IOHIDDeviceCallback = {
+    context, _, _, _ in
+    guard let context else { return }
+    let adapter = Unmanaged<SystemLidHIDManagerAdapter>
+      .fromOpaque(context)
+      .takeUnretainedValue()
+    Task { @MainActor [weak adapter] in
+      adapter?.deviceMatchingHandler?()
+    }
+  }
+
+  private static let deviceRemovalCallback: IOHIDDeviceCallback = {
+    context, _, _, _ in
+    guard let context else { return }
+    let adapter = Unmanaged<SystemLidHIDManagerAdapter>
+      .fromOpaque(context)
+      .takeUnretainedValue()
+    Task { @MainActor [weak adapter] in
+      adapter?.deviceRemovalHandler?()
+    }
+  }
+}
+
 @MainActor
 final class IOKitLidAngleSensor: LidAngleProviding {
   static let vendorID = 0x05AC
@@ -54,14 +244,26 @@ final class IOKitLidAngleSensor: LidAngleProviding {
   // usage 0x047F inside the 0x20/0x8A sensor collection.
   static let angleUsage = 0x047F
 
-  private var manager: IOHIDManager?
+  private let managerFactory: any LidHIDManagerFactory
+  private var manager: (any LidHIDManagerAdapter)?
   private var device: IOHIDDevice?
   private var angleElement: IOHIDElement?
   private var angleHandler: ((Double) -> Void)?
   private var callbackQueue: DispatchQueue?
   private var connectionStateMachine = LidSensorConnectionStateMachine()
+  private var deliveryGeneration: UInt64 = 0
+  private var managerAttemptedGeneration: UInt64?
+  private var activeManagerID: ObjectIdentifier?
+  private var managerIsActive = false
+  private var cancellingManagers: [ObjectIdentifier: any LidHIDManagerAdapter] = [:]
 
   var connectionState: LidSensorConnectionState { connectionStateMachine.state }
+
+  init(
+    managerFactory: any LidHIDManagerFactory = SystemLidHIDManagerFactory()
+  ) {
+    self.managerFactory = managerFactory
+  }
 
   func currentAngle() -> Double? {
     guard ensureDevice() else { return nil }
@@ -83,6 +285,9 @@ final class IOKitLidAngleSensor: LidAngleProviding {
 
   func startMonitoring(onChange: @escaping (Double) -> Void) {
     angleHandler = onChange
+    if manager == nil {
+      deliveryGeneration &+= 1
+    }
     _ = ensureManager()
     _ = attachMatchingDevice()
     if let angle = currentAngle() {
@@ -91,6 +296,7 @@ final class IOKitLidAngleSensor: LidAngleProviding {
   }
 
   func stopMonitoring() {
+    deliveryGeneration &+= 1
     angleHandler = nil
     stopManager()
   }
@@ -102,11 +308,17 @@ final class IOKitLidAngleSensor: LidAngleProviding {
   }
 
   private func ensureManager() -> Bool {
-    guard manager == nil else { return true }
-    let manager = IOHIDManagerCreate(
-      kCFAllocatorDefault,
-      IOOptionBits(kIOHIDOptionsTypeNone)
-    )
+    guard manager == nil else { return managerIsActive }
+    guard managerAttemptedGeneration != deliveryGeneration else {
+      return false
+    }
+    managerAttemptedGeneration = deliveryGeneration
+    guard let manager = managerFactory.makeManager() else {
+      connectionStateMachine.stopped()
+      return false
+    }
+    let managerID = ObjectIdentifier(manager as AnyObject)
+    let generation = deliveryGeneration
 
     let matching: [String: Any] = [
       kIOHIDVendorIDKey as String: Self.vendorID,
@@ -114,45 +326,77 @@ final class IOKitLidAngleSensor: LidAngleProviding {
       kIOHIDPrimaryUsagePageKey as String: Self.usagePage,
       kIOHIDPrimaryUsageKey as String: Self.usage,
     ]
-    IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
-
+    self.manager = manager
+    activeManagerID = nil
+    managerIsActive = false
+    manager.setDeviceMatching(matching)
+    manager.registerInputValueHandler { [weak self] value in
+      self?.handleInputValue(
+        value,
+        managerID: managerID,
+        generation: generation
+      )
+    }
+    manager.registerDeviceMatchingHandler { [weak self] in
+      self?.handleDeviceMatching(
+        managerID: managerID,
+        generation: generation
+      )
+    }
+    manager.registerDeviceRemovalHandler { [weak self] in
+      self?.handleDeviceRemoval(
+        managerID: managerID,
+        generation: generation
+      )
+    }
     let callbackQueue = DispatchQueue(
       label: "app.codexnotsleep.lid-angle-events",
       qos: .userInitiated
     )
-    IOHIDManagerRegisterInputValueCallback(
-      manager,
-      Self.inputValueCallback,
-      Unmanaged.passUnretained(self).toOpaque()
-    )
-    IOHIDManagerRegisterDeviceMatchingCallback(
-      manager,
-      Self.deviceMatchingCallback,
-      Unmanaged.passUnretained(self).toOpaque()
-    )
-    IOHIDManagerRegisterDeviceRemovalCallback(
-      manager,
-      Self.deviceRemovalCallback,
-      Unmanaged.passUnretained(self).toOpaque()
-    )
-    IOHIDManagerSetDispatchQueue(manager, callbackQueue)
-    self.callbackQueue = callbackQueue
-    self.manager = manager
+    manager.setDispatchQueue(callbackQueue)
+    manager.setCancellationHandler { [weak self] in
+      self?.managerCancellationCompleted(managerID: managerID)
+    }
 
-    guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess
-    else {
-      self.manager = nil
-      self.callbackQueue = nil
+    guard manager.open() == kIOReturnSuccess else {
+      discardFailedManager(manager, managerID: managerID)
       return false
     }
+
+    guard manager.activate() else {
+      discardFailedManager(manager, managerID: managerID)
+      return false
+    }
+
+    activeManagerID = managerID
+    managerIsActive = true
+    self.callbackQueue = callbackQueue
     connectionStateMachine.managerOpened()
     return true
   }
 
+  private func discardFailedManager(
+    _ manager: any LidHIDManagerAdapter,
+    managerID: ObjectIdentifier
+  ) {
+    if activeManagerID == managerID {
+      activeManagerID = nil
+      managerIsActive = false
+    }
+    if let currentManager = self.manager,
+      ObjectIdentifier(currentManager as AnyObject) == managerID
+    {
+      self.manager = nil
+    }
+    callbackQueue = nil
+    connectionStateMachine.stopped()
+    manager.close()
+  }
+
   private func attachMatchingDevice() -> Bool {
     if device != nil { return true }
-    guard let manager else { return false }
-    guard let devices = IOHIDManagerCopyDevices(manager) else {
+    guard let manager, managerIsActive else { return false }
+    guard let devices = manager.copyDevices() else {
       return false
     }
 
@@ -232,70 +476,86 @@ final class IOKitLidAngleSensor: LidAngleProviding {
 
   private func stopManager() {
     detachDevice()
+    managerIsActive = false
+    activeManagerID = nil
     if let manager {
-      IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
       self.manager = nil
+      let managerID = ObjectIdentifier(manager as AnyObject)
+      cancellingManagers[managerID] = manager
+      manager.cancel()
     }
     callbackQueue = nil
     connectionStateMachine.stopped()
   }
 
-  private func handleInputValue(_ value: IOHIDValue) {
-    let element = IOHIDValueGetElement(value)
-    guard IOHIDElementGetUsagePage(element) == Self.usagePage,
-      IOHIDElementGetUsage(element) == Self.angleUsage
-    else { return }
-
-    let rawAngle = IOHIDValueGetIntegerValue(value)
-    let angle =
-      rawAngle <= 1
-      ? 0.0
-      : min(Double(rawAngle), LidBrightnessCurve.sensorMaximumAngle)
-    Task { @MainActor [weak self] in
-      self?.angleHandler?(angle)
+  private func managerCancellationCompleted(managerID: ObjectIdentifier) {
+    guard let manager = cancellingManagers.removeValue(forKey: managerID) else {
+      return
     }
+    manager.close()
   }
 
-  private func handleDeviceMatching() {
+  private func isCurrentManager(
+    managerID: ObjectIdentifier,
+    generation: UInt64
+  ) -> Bool {
+    managerIsActive
+      && activeManagerID == managerID
+      && deliveryGeneration == generation
+      && angleHandler != nil
+  }
+
+  private func handleInputValue(
+    _ value: LidHIDInputValue,
+    managerID: ObjectIdentifier,
+    generation: UInt64
+  ) {
+    guard isCurrentManager(managerID: managerID, generation: generation),
+      value.usagePage == Self.usagePage,
+      value.usage == Self.angleUsage,
+      let angle = Self.normalizedAngle(value.integerValue)
+    else { return }
+
+    angleHandler?(angle)
+  }
+
+  private func handleDeviceMatching(
+    managerID: ObjectIdentifier,
+    generation: UInt64
+  ) {
+    guard isCurrentManager(managerID: managerID, generation: generation) else {
+      return
+    }
     Task { @MainActor [weak self] in
-      guard let self, self.angleHandler != nil, self.device == nil else { return }
+      guard let self,
+        self.isCurrentManager(managerID: managerID, generation: generation),
+        self.device == nil
+      else { return }
       guard attachMatchingDevice(), let angle = currentAngle() else { return }
       angleHandler?(angle)
     }
   }
 
-  private func handleDeviceRemoval() {
+  private func handleDeviceRemoval(
+    managerID: ObjectIdentifier,
+    generation: UInt64
+  ) {
+    guard isCurrentManager(managerID: managerID, generation: generation) else {
+      return
+    }
     Task { @MainActor [weak self] in
-      guard let self, self.angleHandler != nil else { return }
+      guard let self,
+        self.isCurrentManager(managerID: managerID, generation: generation)
+      else { return }
       detachDevice()
     }
   }
 
-  private static let inputValueCallback: IOHIDValueCallback = {
-    context, _, _, value in
-    guard let context else { return }
-    let sensor = Unmanaged<IOKitLidAngleSensor>
-      .fromOpaque(context)
-      .takeUnretainedValue()
-    sensor.handleInputValue(value)
-  }
-
-  private static let deviceMatchingCallback: IOHIDDeviceCallback = {
-    context, _, _, _ in
-    guard let context else { return }
-    let sensor = Unmanaged<IOKitLidAngleSensor>
-      .fromOpaque(context)
-      .takeUnretainedValue()
-    sensor.handleDeviceMatching()
-  }
-
-  private static let deviceRemovalCallback: IOHIDDeviceCallback = {
-    context, _, _, _ in
-    guard let context else { return }
-    let sensor = Unmanaged<IOKitLidAngleSensor>
-      .fromOpaque(context)
-      .takeUnretainedValue()
-    sensor.handleDeviceRemoval()
+  private static func normalizedAngle(_ rawAngle: Int64) -> Double? {
+    guard (0...360).contains(rawAngle) else { return nil }
+    return rawAngle <= 1
+      ? 0
+      : min(Double(rawAngle), LidBrightnessCurve.sensorMaximumAngle)
   }
 }
 

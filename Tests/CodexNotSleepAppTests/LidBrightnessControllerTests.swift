@@ -1,5 +1,6 @@
 import CodexNotSleepCore
 import Foundation
+import IOKit
 import Testing
 
 @testable import CodexNotSleepApp
@@ -17,6 +18,174 @@ struct LidBrightnessControllerTests {
     machine.deviceAttached()
     machine.stopped()
     #expect(machine.state == .stopped)
+  }
+
+  @Test
+  func lidHIDManagerUsesRequiredStartOrderAndDoesNotActivateTwice() {
+    let factory = TestLidHIDManagerFactory()
+    let sensor = IOKitLidAngleSensor(managerFactory: factory)
+
+    sensor.startMonitoring { _ in }
+    sensor.startMonitoring { _ in }
+
+    #expect(factory.managers.count == 1)
+    #expect(
+      factory.managers[0].events == [
+        "create",
+        "match",
+        "input-callback",
+        "matching-callback",
+        "removal-callback",
+        "queue",
+        "cancel-handler",
+        "open",
+        "activate",
+      ]
+    )
+  }
+
+  @Test
+  func lidHIDStopInvalidatesDeliveryAndCleansUpAfterCancellation() {
+    let factory = TestLidHIDManagerFactory()
+    let sensor = IOKitLidAngleSensor(managerFactory: factory)
+    var received: [Double] = []
+
+    sensor.startMonitoring { received.append($0) }
+    let manager = factory.managers[0]
+    manager.emit(rawAngle: 100)
+    sensor.stopMonitoring()
+
+    manager.emit(rawAngle: 30)
+    #expect(received == [100])
+    #expect(manager.cancelCount == 1)
+    #expect(manager.closeCount == 0)
+
+    manager.completeCancellation()
+    manager.completeCancellation()
+    #expect(manager.closeCount == 1)
+  }
+
+  @Test
+  func lidHIDStopThenStartUsesFreshActivatedManagerAndRejectsStaleEvents() {
+    let factory = TestLidHIDManagerFactory()
+    let sensor = IOKitLidAngleSensor(managerFactory: factory)
+    var received: [Double] = []
+
+    sensor.startMonitoring { received.append($0) }
+    let firstManager = factory.managers[0]
+    firstManager.emit(rawAngle: 100)
+    sensor.stopMonitoring()
+
+    sensor.startMonitoring { received.append($0) }
+    let secondManager = factory.managers[1]
+    firstManager.emit(rawAngle: 60)
+    secondManager.emit(rawAngle: 30)
+
+    #expect(factory.managers.count == 2)
+    #expect(firstManager.cancelCount == 1)
+    #expect(firstManager.closeCount == 0)
+    #expect(secondManager.events.contains("activate"))
+    #expect(received == [100, 30])
+
+    firstManager.completeCancellation()
+    #expect(firstManager.closeCount == 1)
+  }
+
+  @Test
+  func lidHIDCallbackFiltersElementAndDeliversCurrentAngleSequence() {
+    let factory = TestLidHIDManagerFactory()
+    let sensor = IOKitLidAngleSensor(managerFactory: factory)
+    var received: [Double] = []
+
+    sensor.startMonitoring { received.append($0) }
+    let manager = factory.managers[0]
+    manager.emit(
+      usagePage: UInt32(IOKitLidAngleSensor.usagePage),
+      usage: UInt32(IOKitLidAngleSensor.angleUsage - 1),
+      rawAngle: 60
+    )
+    for angle in [100, 60, 30, 10, 100] {
+      manager.emit(rawAngle: Int64(angle))
+    }
+
+    #expect(received == [100, 60, 30, 10, 100])
+  }
+
+  @Test
+  func lidHIDOpenFailureIsClosedOnceWithoutRetrying() {
+    let factory = TestLidHIDManagerFactory()
+    factory.openSucceeds = false
+    let sensor = IOKitLidAngleSensor(managerFactory: factory)
+
+    sensor.startMonitoring { _ in }
+    _ = sensor.currentAngle()
+    _ = sensor.currentAngle()
+
+    #expect(factory.managers.count == 1)
+    #expect(factory.managers[0].cancelCount == 0)
+    #expect(factory.managers[0].closeCount == 1)
+  }
+
+  @Test
+  func lidHIDActivationFailureIsClosedOnceWithoutRetrying() {
+    let factory = TestLidHIDManagerFactory()
+    factory.activationSucceeds = false
+    let sensor = IOKitLidAngleSensor(managerFactory: factory)
+
+    sensor.startMonitoring { _ in }
+    _ = sensor.currentAngle()
+    _ = sensor.currentAngle()
+
+    #expect(factory.managers.count == 1)
+    #expect(factory.managers[0].cancelCount == 0)
+    #expect(factory.managers[0].closeCount == 1)
+  }
+
+  @Test
+  func lidHIDManagerCreationFailureDegradesWithoutRetryLoop() {
+    let factory = TestLidHIDManagerFactory()
+    factory.returnsNil = true
+    let sensor = IOKitLidAngleSensor(managerFactory: factory)
+
+    sensor.startMonitoring { _ in }
+    _ = sensor.currentAngle()
+    _ = sensor.currentAngle()
+
+    #expect(factory.makeManagerCount == 1)
+    #expect(factory.managers.isEmpty)
+  }
+
+  @Test
+  func lidHIDFailureDoesNotBlockIndependentSleepProtection() {
+    let suiteName = "CodexNotSleep.LidHIDFailureTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    defaults.set(true, forKey: "agentSleepProtectionEnabled")
+
+    let factory = TestLidHIDManagerFactory()
+    factory.openSucceeds = false
+    let sensor = IOKitLidAngleSensor(managerFactory: factory)
+    let brightness = LidBrightnessController(
+      angleSensor: sensor,
+      displayProvider: TestDisplayBrightnessProvider(brightness: 0.8),
+      schedulesTimer: false
+    )
+    let backend = LidBrightnessTestBackend()
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: LidBrightnessTestActivity(
+        snapshot: .active(turnCount: 1)
+      ),
+      protectionGraceSeconds: 0,
+      startsAutomatically: false,
+      lidBrightnessController: brightness
+    )
+
+    controller.refreshCodexActivity()
+
+    #expect(backend.isHeld)
+    #expect(factory.makeManagerCount == 1)
   }
 
   @Test
@@ -483,6 +652,123 @@ struct LidBrightnessControllerTests {
         continuation.resume(returning: result)
       }
     }
+  }
+}
+
+@MainActor
+private final class TestLidHIDManagerFactory: LidHIDManagerFactory {
+  var openSucceeds = true
+  var activationSucceeds = true
+  var returnsNil = false
+  var autoCompleteCancellation = false
+  private(set) var makeManagerCount = 0
+  private(set) var managers: [TestLidHIDManagerAdapter] = []
+
+  func makeManager() -> (any LidHIDManagerAdapter)? {
+    makeManagerCount += 1
+    guard !returnsNil else { return nil }
+    let manager = TestLidHIDManagerAdapter(
+      openSucceeds: openSucceeds,
+      activationSucceeds: activationSucceeds,
+      autoCompleteCancellation: autoCompleteCancellation
+    )
+    managers.append(manager)
+    return manager
+  }
+}
+
+@MainActor
+private final class TestLidHIDManagerAdapter: LidHIDManagerAdapter {
+  private let openSucceeds: Bool
+  private let activationSucceeds: Bool
+  private let autoCompleteCancellation: Bool
+  private var inputValueHandler: LidHIDInputHandler?
+  private var cancellationHandler: LidHIDEventHandler?
+  private var didClose = false
+
+  private(set) var events = ["create"]
+  private(set) var cancelCount = 0
+  private(set) var closeCount = 0
+
+  init(
+    openSucceeds: Bool,
+    activationSucceeds: Bool,
+    autoCompleteCancellation: Bool
+  ) {
+    self.openSucceeds = openSucceeds
+    self.activationSucceeds = activationSucceeds
+    self.autoCompleteCancellation = autoCompleteCancellation
+  }
+
+  func setDeviceMatching(_ matching: [String: Any]) {
+    events.append("match")
+  }
+
+  func registerInputValueHandler(_ handler: @escaping LidHIDInputHandler) {
+    inputValueHandler = handler
+    events.append("input-callback")
+  }
+
+  func registerDeviceMatchingHandler(_ handler: @escaping LidHIDEventHandler) {
+    events.append("matching-callback")
+  }
+
+  func registerDeviceRemovalHandler(_ handler: @escaping LidHIDEventHandler) {
+    events.append("removal-callback")
+  }
+
+  func setDispatchQueue(_ queue: DispatchQueue) {
+    events.append("queue")
+  }
+
+  func setCancellationHandler(_ handler: @escaping LidHIDEventHandler) {
+    cancellationHandler = handler
+    events.append("cancel-handler")
+  }
+
+  func open() -> IOReturn {
+    events.append("open")
+    return openSucceeds ? kIOReturnSuccess : kIOReturnError
+  }
+
+  func activate() -> Bool {
+    events.append("activate")
+    return activationSucceeds
+  }
+
+  func copyDevices() -> CFSet? { nil }
+
+  func cancel() {
+    cancelCount += 1
+    events.append("cancel")
+    if autoCompleteCancellation {
+      cancellationHandler?()
+    }
+  }
+
+  func close() {
+    guard !didClose else { return }
+    didClose = true
+    closeCount += 1
+    events.append("close")
+  }
+
+  func emit(
+    usagePage: UInt32 = UInt32(IOKitLidAngleSensor.usagePage),
+    usage: UInt32 = UInt32(IOKitLidAngleSensor.angleUsage),
+    rawAngle: Int64
+  ) {
+    inputValueHandler?(
+      LidHIDInputValue(
+        usagePage: usagePage,
+        usage: usage,
+        integerValue: rawAngle
+      )
+    )
+  }
+
+  func completeCancellation() {
+    cancellationHandler?()
   }
 }
 
