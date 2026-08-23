@@ -81,6 +81,60 @@ struct CodexActivityWorkerTests {
   }
 
   @Test
+  func staleSnapshotFromAnOldGenerationIsRejectedAfterStopAndRestart() async throws {
+    let provider = GenerationWorkerProvider(
+      snapshots: [.active(turnCount: 1), .active(turnCount: 2)],
+      blocksFirstRefresh: true
+    )
+    let worker = CodexActivityWorker(provider: provider)
+    var received: [CodexActivitySnapshot] = []
+
+    worker.start { snapshot in
+      received.append(snapshot)
+    }
+    for _ in 0..<50 where !provider.firstRefreshHasStarted {
+      try await Task.sleep(for: .milliseconds(2))
+    }
+    #expect(provider.firstRefreshHasStarted)
+
+    worker.stop()
+    worker.start { snapshot in
+      received.append(snapshot)
+    }
+    provider.finishFirstRefresh()
+
+    for _ in 0..<50 where !received.contains(.active(turnCount: 2)) {
+      try await Task.sleep(for: .milliseconds(2))
+    }
+    worker.stop()
+
+    #expect(received == [.active(turnCount: 2)])
+  }
+
+  @Test
+  func mainActorGenerationCheckDoesNotWaitForBlockedWorkerRefresh() async throws {
+    let provider = GenerationWorkerProvider(
+      snapshots: [.active(turnCount: 1)],
+      blocksFirstRefresh: true
+    )
+    let worker = CodexActivityWorker(provider: provider)
+    worker.start { _ in }
+    for _ in 0..<50 where !provider.firstRefreshHasStarted {
+      try await Task.sleep(for: .milliseconds(2))
+    }
+    #expect(provider.firstRefreshHasStarted)
+    let generation = try #require(worker.currentGenerationForTesting)
+
+    let startedAt = DispatchTime.now().uptimeNanoseconds
+    #expect(worker.isGenerationCurrentForTesting(generation))
+    let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
+    #expect(elapsed < 100_000_000)
+
+    provider.finishFirstRefresh()
+    worker.stop()
+  }
+
+  @Test
   func staleEventFromPreviousMonitoringGenerationCannotScheduleRefresh() async throws {
     let provider = WorkerActivityProvider(snapshot: .active(turnCount: 1))
     let worker = CodexActivityWorker(provider: provider)
@@ -187,5 +241,60 @@ private final class WorkerActivityProvider: CodexActivityProviding, @unchecked S
     let handler = handlers.first
     lock.unlock()
     handler?()
+  }
+}
+
+private final class GenerationWorkerProvider: CodexActivityProviding, @unchecked Sendable {
+  private let lock = NSLock()
+  private var storedSnapshot: CodexActivitySnapshot
+  private var snapshots: [CodexActivitySnapshot]
+  private var changeHandler: (@Sendable () -> Void)?
+  private let releaseFirstRefresh = DispatchSemaphore(value: 0)
+  private let blocksFirstRefresh: Bool
+  private var refreshCount = 0
+  private var firstRefreshStarted = false
+
+  init(snapshots: [CodexActivitySnapshot], blocksFirstRefresh: Bool) {
+    self.snapshots = snapshots
+    storedSnapshot = snapshots.first ?? .idle
+    self.blocksFirstRefresh = blocksFirstRefresh
+  }
+
+  var snapshot: CodexActivitySnapshot {
+    lock.withLock { storedSnapshot }
+  }
+
+  var hasPendingWork: Bool { false }
+  var isEventSourceHealthy: Bool { true }
+
+  var firstRefreshHasStarted: Bool {
+    lock.withLock { firstRefreshStarted }
+  }
+
+  func refresh() -> CodexActivitySnapshot {
+    let shouldBlock = lock.withLock {
+      refreshCount += 1
+      let shouldBlock = blocksFirstRefresh && refreshCount == 1
+      if shouldBlock { firstRefreshStarted = true }
+      return shouldBlock
+    }
+    if shouldBlock { releaseFirstRefresh.wait() }
+
+    return lock.withLock {
+      if !snapshots.isEmpty { storedSnapshot = snapshots.removeFirst() }
+      return storedSnapshot
+    }
+  }
+
+  func startMonitoring(onChange: @escaping @Sendable () -> Void) {
+    lock.withLock { changeHandler = onChange }
+  }
+
+  func stopMonitoring() {
+    lock.withLock { changeHandler = nil }
+  }
+
+  func finishFirstRefresh() {
+    releaseFirstRefresh.signal()
   }
 }

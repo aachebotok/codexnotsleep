@@ -30,7 +30,8 @@ Codexetine keeps the historical bundle identifier so existing preferences and
 login-item registration can continue to work. If **/Applications/Codex Not Sleep.app**
 is still present, the first launch of the installed Codexetine app shows a
 native migration prompt. Choose **Move Old App to Trash** only after confirming
-the old copy is no longer running; **Later** leaves it untouched. The migration
+the old copy is no longer running; **Keep Old App** leaves it untouched and
+does not ask again automatically. The migration
 does not remove preferences, closed-lid leases, sudoers configuration, or the
 current Codexetine login item.
 

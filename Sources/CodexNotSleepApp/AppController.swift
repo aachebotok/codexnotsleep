@@ -919,24 +919,17 @@ final class AppController: NSObject {
       NSLog("Codexetine synchronous brightness restoration exhausted during external termination")
     }
 
-    let releaseResult: Result<Void, Error>
-    if usesBackgroundSystemWork {
-      releaseResult = backendWorker.releaseSynchronously()
-    } else {
+    if let releaser = backend as? any ExternalTerminationReleasing {
       do {
-        try backend.release()
-        releaseResult = .success(())
+        try releaser.releaseForExternalTermination()
       } catch {
-        releaseResult = .failure(error)
+        // The lease/watchdog remains the final recovery path for privileged
+        // global state when the narrow IOPM release cannot complete.
+        NSLog(
+          "Codexetine immediate sleep assertion release failed during external termination: %@",
+          error.localizedDescription
+        )
       }
-    }
-    if case .failure(let error) = releaseResult {
-      // The lease/watchdog remains the final recovery path for privileged
-      // global state when the bounded synchronous release cannot complete.
-      NSLog(
-        "Codexetine synchronous sleep restoration failed during external termination: %@",
-        error.localizedDescription
-      )
     }
   }
 

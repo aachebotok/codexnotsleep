@@ -664,7 +664,8 @@ final class PMSetPowerProtectBackend: SleepProtectionBackend,
 }
 
 final class CombinedSleepProtectionBackend: SleepProtectionBackend,
-  ClosedLidProtectionManaging, ClosedLidProtectionInspecting, ClosedLidProtectionReleasing
+  ClosedLidProtectionManaging, ClosedLidProtectionInspecting, ClosedLidProtectionReleasing,
+  ExternalTerminationReleasing
 {
   let identifier = "IOPM + pmset closed-lid protection"
   var isHeld: Bool { idleSleep.isHeld || closedLid.isHeld }
@@ -775,6 +776,14 @@ final class CombinedSleepProtectionBackend: SleepProtectionBackend,
       }
     }
     if let firstError { throw firstError }
+  }
+
+  func releaseForExternalTermination() throws {
+    // External termination cannot wait for the worker queue or the bounded
+    // pmset/lease/watchdog sequence. Release only the ordinary IOPM layer;
+    // the closed-lid lease remains owned by its watchdog for EOF recovery.
+    guard let releaser = idleSleep as? any ExternalTerminationReleasing else { return }
+    try releaser.releaseForExternalTermination()
   }
 
   func releaseClosedLid() throws {

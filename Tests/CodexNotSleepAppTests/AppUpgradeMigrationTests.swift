@@ -37,7 +37,7 @@ struct AppUpgradeMigrationTests {
   }
 
   @Test
-  func laterLeavesTheOldBundleUntouchedAndDoesNotRepeatEveryLaunch() throws {
+  func keepOldAppLeavesTheOldBundleUntouchedAndDoesNotRepeatEveryLaunch() throws {
     let defaults = try makeDefaults()
     let oldApp = try makeLegacyBundle()
     defer {
@@ -45,7 +45,7 @@ struct AppUpgradeMigrationTests {
       try? FileManager.default.removeItem(at: oldApp)
     }
 
-    let prompt = TestMigrationPrompt(choice: .later)
+    let prompt = TestMigrationPrompt(choice: .keepOldApp)
     let recycler = TestMigrationRecycler()
     let controller = makeController(
       defaults: defaults,
@@ -60,6 +60,14 @@ struct AppUpgradeMigrationTests {
     #expect(prompt.callCount == 1)
     #expect(recycler.recycledURLs.isEmpty)
     #expect(FileManager.default.fileExists(atPath: oldApp.path))
+  }
+
+  @Test
+  func migrationButtonWordingMatchesPermanentChoices() {
+    #expect(
+      SystemCodexetineMigrationPrompt.moveOldAppButtonTitle
+        == "Move Old App to Trash")
+    #expect(SystemCodexetineMigrationPrompt.keepOldAppButtonTitle == "Keep Old App")
   }
 
   @Test

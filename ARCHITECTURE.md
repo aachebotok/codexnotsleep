@@ -49,7 +49,9 @@ descriptors. It is not the normal activity loop.
 `SleepProtectionWorker` owns a separate serial utility queue for IOPM,
 `pmset`, `sudo`, AppleScript, lease, watchdog, and other blocking backend
 operations. Results are delivered to `AppController` on the main actor in
-submission order.
+submission order. The external `applicationWillTerminate` path is the narrow
+exception: it calls a dedicated fast-release API directly, which only attempts
+the non-privileged IOPM assertion release and never enters this queue.
 
 ## Native menu-bar UI
 
@@ -183,10 +185,11 @@ sleep protection does not depend on brightness success.
 
 The menu Quit path may await that finite brightness budget before terminating.
 The external `applicationWillTerminate` path cannot await a later callback, so
-it performs one synchronous best-effort brightness restore and a synchronous,
-serially ordered backend release. If privileged restoration still fails, the
-app-owned lease and watchdog remain the recovery path; no delayed task is
-started during process termination.
+it performs one synchronous best-effort brightness restore and the dedicated
+fast IOPM release. It does not run the normal privileged `pmset` sequence or
+wait behind queued worker work; the app-owned closed-lid lease and watchdog
+remain the recovery path. No delayed cleanup task is started during process
+termination.
 
 ## Battery and login behavior
 

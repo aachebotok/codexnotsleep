@@ -163,6 +163,35 @@ struct PowerProtectTests {
   }
 
   @Test
+  func externalTerminationReleasesOnlyIOPMAndLeavesClosedLidLeaseForWatchdog() throws {
+    let root = FileManager.default.temporaryDirectory.appending(
+      path: "CodexNotSleep.ExternalTerminationLease.\(UUID().uuidString)"
+    )
+    let runner = RecordingPowerProtectRunner(results: [])
+    let leaseStore = PowerProtectLeaseStore(url: root.appending(path: "lease"))
+    let watchdog = FakePowerProtectWatchdog()
+    _ = try leaseStore.begin()
+    let closedLid = PMSetPowerProtectBackend(
+      installer: FakePowerProtectInstaller(isInstalled: true),
+      runner: runner,
+      leaseStore: leaseStore,
+      watchdog: watchdog
+    )
+    let idle = PartialSleepProtectionBackend(isHeld: true)
+    let backend = CombinedSleepProtectionBackend(idleSleep: idle, closedLid: closedLid)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try backend.releaseForExternalTermination()
+
+    #expect(idle.externalTerminationReleaseCount == 1)
+    #expect(!idle.isHeld)
+    #expect(closedLid.isHeld)
+    #expect(leaseStore.hasLease)
+    #expect(watchdog.stopCount == 0)
+    #expect(runner.invocations.isEmpty)
+  }
+
+  @Test
   func productionSetupRepairRevalidatesThenUsesTargetedClosedLidRelease() throws {
     let root = FileManager.default.temporaryDirectory.appending(
       path: "CodexNotSleep.PowerProtectControllerRepair.\(UUID().uuidString)"
@@ -594,6 +623,18 @@ struct PowerProtectTests {
   }
 
   @Test
+  func externalTerminationReleaseImmediatelyReleasesTheIOPMAssertion() throws {
+    let manager = FakeIOPMAssertionManager()
+    let backend = IdleSleepAssertionBackend(assertionManager: manager)
+
+    try backend.acquire()
+    try backend.releaseForExternalTermination()
+
+    #expect(manager.lastReleasedID == manager.createdID)
+    #expect(!backend.isHeld)
+  }
+
+  @Test
   func watchdogShellScriptHasValidSyntaxAndUsesFinitePipeLiveness() throws {
     let runner = ProcessPowerProtectCommandRunner()
     let result = try runner.run(
@@ -711,12 +752,15 @@ private final class RecordingPowerProtectAuthorizationRunner:
   }
 }
 
-private final class PartialSleepProtectionBackend: SleepProtectionBackend {
+private final class PartialSleepProtectionBackend: SleepProtectionBackend,
+  ExternalTerminationReleasing
+{
   let identifier = "partial-fake"
   private(set) var isHeld: Bool
   private(set) var acquireCount = 0
   private(set) var renewCount = 0
   private(set) var recoverCount = 0
+  private(set) var externalTerminationReleaseCount = 0
 
   init(isHeld: Bool) {
     self.isHeld = isHeld
@@ -736,6 +780,11 @@ private final class PartialSleepProtectionBackend: SleepProtectionBackend {
   }
 
   func release() {
+    isHeld = false
+  }
+
+  func releaseForExternalTermination() {
+    externalTerminationReleaseCount += 1
     isHeld = false
   }
 }

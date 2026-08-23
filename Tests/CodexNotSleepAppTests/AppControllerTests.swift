@@ -539,6 +539,10 @@ struct AppControllerTests {
     )
     controller.start()
     controller.refreshCodexActivity()
+    for _ in 0..<40 where activity.startMonitoringCount < 1 {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(activity.startMonitoringCount == 1)
     backend.failNextRelease = true
 
     controller.quit()
@@ -583,7 +587,7 @@ struct AppControllerTests {
   }
 
   @Test
-  func externalTerminationUsesSynchronousBrightnessAndBackendCleanup() throws {
+  func externalTerminationUsesSynchronousBrightnessAndFastIOPMRelease() throws {
     let defaults = try makeDefaults()
     defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
     defaults.set(true, forKey: ProtectionPreferenceStore.key)
@@ -607,8 +611,69 @@ struct AppControllerTests {
 
     #expect(brightness.externalRestoreCount == 1)
     #expect(brightness.shutdownRestoreCount == 0)
-    #expect(backend.releaseCount == 1)
+    #expect(backend.externalTerminationReleaseCount == 1)
+    #expect(backend.releaseCount == 0)
     #expect(!backend.isHeld)
+  }
+
+  @Test
+  func externalTerminationDoesNotWaitBehindSleepWorkerQueue() async throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+
+    let backend = BlockingRecoveryBackend()
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: TestCodexActivityProvider(snapshot: .idle),
+      startsAutomatically: false,
+      lidBrightnessController: TestShutdownBrightnessController(),
+      performsSystemWorkOffMainActor: true
+    )
+    controller.start()
+    defer { backend.finishRecovery() }
+
+    for _ in 0..<100 where !backend.recoveryHasStarted {
+      try await Task.sleep(for: .milliseconds(2))
+    }
+    #expect(backend.recoveryHasStarted)
+
+    let startedAt = DispatchTime.now().uptimeNanoseconds
+    NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
+    let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
+
+    #expect(elapsed < 100_000_000)
+    #expect(backend.externalTerminationReleaseCount == 1)
+    #expect(backend.releaseCount == 0)
+  }
+
+  @Test
+  func gracefulQuitStillUsesTheNormalBackendRelease() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+
+    let backend = TestSleepProtectionBackend()
+    let brightness = TestShutdownBrightnessController()
+    let controller = AppController(
+      defaults: defaults,
+      backend: backend,
+      codexActivityProvider: TestCodexActivityProvider(snapshot: .active(turnCount: 1)),
+      protectionGraceSeconds: 0,
+      startsAutomatically: false,
+      lidBrightnessController: brightness
+    )
+    controller.start()
+    controller.refreshCodexActivity()
+    backend.failNextRelease = true
+
+    controller.quit()
+    brightness.finish(.restored)
+
+    #expect(backend.releaseCount == 1)
+    #expect(backend.externalTerminationReleaseCount == 0)
+    #expect(controller.menuIssue == .sleepRestoreRequired)
   }
 
   @Test
@@ -708,7 +773,9 @@ struct AppControllerTests {
   private static let suiteNameKey = "CodexNotSleep.AppControllerTests.suiteName"
 }
 
-private final class TestSleepProtectionBackend: SleepProtectionBackend {
+private final class TestSleepProtectionBackend: SleepProtectionBackend,
+  ExternalTerminationReleasing
+{
   let identifier = "app-controller-test"
   private(set) var isHeld = false
   var requiresSetup: Bool
@@ -718,6 +785,7 @@ private final class TestSleepProtectionBackend: SleepProtectionBackend {
   private(set) var prepareCount = 0
   private(set) var recoverCount = 0
   private(set) var acquireCount = 0
+  private(set) var externalTerminationReleaseCount = 0
   private(set) var releaseCount = 0
 
   init(requiresSetup: Bool = false, prepareError: Error? = nil) {
@@ -750,6 +818,62 @@ private final class TestSleepProtectionBackend: SleepProtectionBackend {
       throw TestBackendError.release
     }
     isHeld = false
+  }
+
+  func releaseForExternalTermination() throws {
+    externalTerminationReleaseCount += 1
+    isHeld = false
+  }
+}
+
+private final class BlockingRecoveryBackend: SleepProtectionBackend,
+  ExternalTerminationReleasing, @unchecked Sendable
+{
+  let identifier = "blocking-recovery-test"
+  private let lock = NSLock()
+  private let recoveryRelease = DispatchSemaphore(value: 0)
+  private var held = false
+  private var didEnterRecovery = false
+  private(set) var releaseCount = 0
+  private(set) var externalTerminationReleaseCount = 0
+
+  var isHeld: Bool {
+    lock.withLock { held }
+  }
+
+  var recoveryHasStarted: Bool {
+    lock.withLock { didEnterRecovery }
+  }
+
+  func prepare() throws {}
+
+  func recover() throws {
+    lock.withLock { didEnterRecovery = true }
+    recoveryRelease.wait()
+  }
+
+  func acquire() throws {
+    lock.withLock { held = true }
+  }
+
+  func renew() throws {}
+
+  func release() throws {
+    lock.withLock {
+      releaseCount += 1
+      held = false
+    }
+  }
+
+  func releaseForExternalTermination() throws {
+    lock.withLock {
+      externalTerminationReleaseCount += 1
+      held = false
+    }
+  }
+
+  func finishRecovery() {
+    recoveryRelease.signal()
   }
 }
 

@@ -24,6 +24,13 @@ protocol IOPMAssertionManaging {
   func release(_ assertionID: IOPMAssertionID) -> IOReturn
 }
 
+/// The only sleep-protection operation safe to attempt synchronously during
+/// external process termination. Implementations must not enter a worker
+/// queue or run privileged closed-lid recovery.
+protocol ExternalTerminationReleasing: AnyObject {
+  func releaseForExternalTermination() throws
+}
+
 struct SystemIOPMAssertionManager: IOPMAssertionManaging {
   func createPreventUserIdleSystemSleep(
     name: String,
@@ -42,18 +49,25 @@ struct SystemIOPMAssertionManager: IOPMAssertionManaging {
   }
 }
 
-final class IdleSleepAssertionBackend: SleepProtectionBackend {
+final class IdleSleepAssertionBackend: SleepProtectionBackend, ExternalTerminationReleasing {
   let identifier = "IOPM idle-sleep assertion"
-  private(set) var isHeld = false
+  private let stateLock = NSLock()
+  private var held = false
   private var assertionID = IOPMAssertionID(0)
   private let assertionManager: any IOPMAssertionManaging
+
+  var isHeld: Bool {
+    stateLock.withLock { held }
+  }
 
   init(assertionManager: any IOPMAssertionManaging = SystemIOPMAssertionManager()) {
     self.assertionManager = assertionManager
   }
 
   func acquire() throws {
-    guard !isHeld else { return }
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    guard !held else { return }
 
     let result = assertionManager.createPreventUserIdleSystemSleep(
       name: "Codexetine: supported coding agent is running",
@@ -62,18 +76,27 @@ final class IdleSleepAssertionBackend: SleepProtectionBackend {
     guard result == kIOReturnSuccess else {
       throw BackendError.assertionFailed(result)
     }
-    isHeld = true
+    held = true
   }
 
   func renew() throws {}
 
   func release() throws {
-    guard isHeld else { return }
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    guard held else { return }
     let result = assertionManager.release(assertionID)
     guard result == kIOReturnSuccess else {
       throw BackendError.assertionReleaseFailed(result)
     }
     assertionID = 0
-    isHeld = false
+    held = false
+  }
+
+  func releaseForExternalTermination() throws {
+    // IOPMAssertionRelease is the narrow, non-privileged operation allowed on
+    // the external termination path. Closed-lid recovery stays with its
+    // lease/watchdog owner.
+    try release()
   }
 }

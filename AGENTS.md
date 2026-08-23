@@ -127,9 +127,11 @@ If the tree changes, update this map.
 - The optional `Keep Awake with Lid Closed` action is the only normal path that requests
   administrator setup; ordinary open-lid IOPM protection must remain independent.
 - Never broaden sudo privileges for convenience.
-- External termination uses synchronous bounded best-effort brightness and
-  backend cleanup; only the graceful menu Quit path waits for asynchronous
-  brightness completion.
+- External termination uses synchronous best-effort brightness and only the
+  dedicated fast IOPM release; it never waits on the sleep worker or runs the
+  privileged closed-lid cleanup sequence. The lease/watchdog is the fallback.
+  Only the graceful menu Quit path waits for asynchronous brightness
+  completion and the normal bounded backend release.
 
 Critical invariant:
 

@@ -3,7 +3,7 @@ import Foundation
 
 enum CodexetineMigrationChoice: Equatable {
   case moveOldAppToTrash
-  case later
+  case keepOldApp
 }
 
 @MainActor
@@ -21,6 +21,9 @@ protocol CodexetineMigrationRecycling: AnyObject {
 
 @MainActor
 final class SystemCodexetineMigrationPrompt: CodexetineMigrationPrompting {
+  static let moveOldAppButtonTitle = "Move Old App to Trash"
+  static let keepOldAppButtonTitle = "Keep Old App"
+
   func choose(oldAppURL: URL, isRunning: Bool) -> CodexetineMigrationChoice {
     let alert = NSAlert()
     alert.messageText = "Older Codex Not Sleep app still installed"
@@ -29,11 +32,11 @@ final class SystemCodexetineMigrationPrompt: CodexetineMigrationPrompting {
       ? "An older Codex Not Sleep app is still installed and currently running. It can cause duplicate login behavior. Quit that copy first, then choose this action again."
       : "An older Codex Not Sleep app is still installed and may cause duplicate login behavior. Move it to the Trash after you confirm."
     alert.alertStyle = .warning
-    alert.addButton(withTitle: "Move Old App to Trash")
-    alert.addButton(withTitle: "Later")
+    alert.addButton(withTitle: Self.moveOldAppButtonTitle)
+    alert.addButton(withTitle: Self.keepOldAppButtonTitle)
     return alert.runModal() == .alertFirstButtonReturn
       ? .moveOldAppToTrash
-      : .later
+      : .keepOldApp
   }
 }
 
@@ -103,7 +106,7 @@ final class CodexetineUpgradeMigrationController {
 
     let oldAppIsRunning = isRunning(legacyBundleURL, Self.legacyBundleIdentifier)
     switch prompt.choose(oldAppURL: legacyBundleURL, isRunning: oldAppIsRunning) {
-    case .later:
+    case .keepOldApp:
       defaults.set(true, forKey: Self.promptShownKey)
     case .moveOldAppToTrash:
       // Never recycle a bundle while its exact, validated identity is still
