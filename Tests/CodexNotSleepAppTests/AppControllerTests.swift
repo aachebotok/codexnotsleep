@@ -1,3 +1,4 @@
+import AppKit
 import CodexNotSleepCore
 import Foundation
 import Testing
@@ -133,6 +134,33 @@ struct AppControllerTests {
     activity.snapshot = .idle
     controller.refreshCodexActivity()
     controller.setProtectionEnabled(false)
+    #expect(scheduler.scheduledDeadline == nil)
+  }
+
+  @Test
+  func shutdownCancelsGraceDeadline() throws {
+    let defaults = try makeDefaults()
+    defer { defaults.removePersistentDomain(forName: defaultsSuiteName(defaults)) }
+    defaults.set(true, forKey: ProtectionPreferenceStore.key)
+
+    let scheduler = TestGraceDeadlineScheduler()
+    let activity = TestCodexActivityProvider(snapshot: .active(turnCount: 1))
+    let controller = makeController(
+      defaults: defaults,
+      backend: TestSleepProtectionBackend(),
+      activity: activity,
+      graceSeconds: 15,
+      graceDeadlineScheduler: scheduler
+    )
+
+    controller.refreshCodexActivity()
+    activity.snapshot = .idle
+    controller.refreshCodexActivity()
+    #expect(scheduler.scheduledDeadline != nil)
+
+    controller.start()
+    NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
+
     #expect(scheduler.scheduledDeadline == nil)
   }
 
